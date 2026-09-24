@@ -850,10 +850,50 @@ st.info(
     "anti-collision analysis."
 )
 
-uploaded = st.file_uploader(
-    "Upload Offset Well Excel File",
-    type=["xlsx", "xls"],
-)
+def create_offset_well_template():
+    """Create a blank Excel template matching the required offset-well input format."""
+    bio = io.BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        pd.DataFrame(columns=["Well", "X", "Y", "Z"]).to_excel(
+            writer, sheet_name="Well_Header", index=False
+        )
+        pd.DataFrame(columns=["Well", "MD", "Inclination", "Azimuth"]).to_excel(
+            writer, sheet_name="Survey", index=False
+        )
+
+        # Light formatting so the template is immediately understandable.
+        wb = writer.book
+        for ws in [wb["Well_Header"], wb["Survey"]]:
+            ws.freeze_panes = "A2"
+            from openpyxl.styles import Font
+            for cell in ws[1]:
+                cell.font = Font(bold=True)
+            for column_cells in ws.columns:
+                max_len = max(len(str(cell.value or "")) for cell in column_cells)
+                ws.column_dimensions[column_cells[0].column_letter].width = max(12, max_len + 3)
+
+    bio.seek(0)
+    return bio.getvalue()
+
+
+template_data = create_offset_well_template()
+
+col_upload, col_template = st.columns([3, 1])
+with col_upload:
+    uploaded = st.file_uploader(
+        "Upload Offset Well Excel File",
+        type=["xlsx", "xls"],
+    )
+with col_template:
+    st.write("")
+    st.write("")
+    st.download_button(
+        label="📥 Download Excel Template",
+        data=template_data,
+        file_name="Offset_Well_Input_Template.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
 
 if uploaded:
     try:
