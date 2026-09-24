@@ -841,7 +841,7 @@ st.set_page_config(page_title="Preliminary Anti-Collision Tool", layout="wide")
 
 st.title("Preliminary Anti-Collision Tool")
 st.caption(
-    "Phase 1 — Offset Well Data | Phase 2 — New Well Trajectory | Phase 3 — Anti-Collision Analysis"
+    "Phase 1 — Offset Well Data | Phase 2 — New Well Trajectory | Phase 3 — Anti-Collision Analysis | developed by Didin Irwansyah"
 )
 
 st.info(
