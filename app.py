@@ -1,7 +1,7 @@
 import math
 import io
-import base64
 import os
+import base64
 import numpy as np
 from math import sqrt, radians, degrees, acos, cos, sin, tan, atan2
 import pandas as pd
@@ -36,9 +36,9 @@ from trajectory import (
 # ----------------------------------------------------------------------
 # PDF REPORT GENERATOR
 # ----------------------------------------------------------------------
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
-REPORT_LOGO = os.path.join(APP_DIR, "rigsis_logo.png")
-APP_ICON = os.path.join(APP_DIR, "anti_collision_icon.png")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+REPORT_LOGO = os.path.join(BASE_DIR, "rigsis_logo.png")
+FAVICON_PATH = os.path.join(BASE_DIR, "anti_collision_icon.png")
 
 
 def _fmt(v, decimals=2):
@@ -542,13 +542,13 @@ def generate_pdf_report(project, result, p3_detailed, uncertainty_result, phase3
         story.append(logo)
         story.append(Spacer(1, 12*mm))
 
-    # Tool icon / favicon on the report cover.
-    if APP_ICON and os.path.exists(APP_ICON):
-        app_icon = RLImage(APP_ICON)
-        app_icon.drawWidth = 30*mm
-        app_icon.drawHeight = 30*mm
-        story.append(app_icon)
-        story.append(Spacer(1, 8*mm))
+    # Use the same 512x512 transparent favicon as a small cover identity mark.
+    if FAVICON_PATH and os.path.exists(FAVICON_PATH):
+        cover_icon = RLImage(FAVICON_PATH)
+        cover_icon.drawWidth = 18*mm
+        cover_icon.drawHeight = 18*mm
+        story.append(cover_icon)
+        story.append(Spacer(1, 10*mm))
 
     story.append(Paragraph("PRELIMINARY", styles["ReportTitle"]))
     story.append(Paragraph("ANTI-COLLISION ASSESSMENT", styles["ReportTitle"]))
@@ -852,26 +852,29 @@ def build_well_color_map(df):
 
 st.set_page_config(
     page_title="Preliminary Anti-Collision Tool",
-    page_icon=APP_ICON if os.path.exists(APP_ICON) else "⚠️",
+    page_icon=FAVICON_PATH if os.path.exists(FAVICON_PATH) else "🧭",
     layout="wide",
 )
 
-# Main application header with the same icon used as the browser favicon.
-if os.path.exists(APP_ICON):
-    with open(APP_ICON, "rb") as _icon_file:
-        _icon_b64 = base64.b64encode(_icon_file.read()).decode("ascii")
-    st.markdown(
-        f"""
-        <div style="display:flex; align-items:center; gap:14px; margin-bottom:2px;">
-            <img src="data:image/png;base64,{_icon_b64}"
-                 style="width:54px;height:54px;object-fit:contain;flex:0 0 auto;">
-            <div style="font-size:2.25rem;font-weight:700;line-height:1.15;">
-                Preliminary Anti-Collision Tool
+# Tool header with the same icon used for the browser favicon.
+if os.path.exists(FAVICON_PATH):
+    try:
+        with open(FAVICON_PATH, "rb") as _f:
+            _icon_b64 = base64.b64encode(_f.read()).decode("ascii")
+        st.markdown(
+            f"""
+            <div style="display:flex; align-items:center; gap:14px; margin-top:-8px; margin-bottom:4px;">
+                <img src="data:image/png;base64,{_icon_b64}"
+                     style="width:54px; height:54px; object-fit:contain; flex:0 0 54px;">
+                <div style="font-size:2.55rem; line-height:1.15; font-weight:700; color:#FAFAFA;">
+                    Preliminary Anti-Collision Tool
+                </div>
             </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+            """,
+            unsafe_allow_html=True,
+        )
+    except Exception:
+        st.title("Preliminary Anti-Collision Tool")
 else:
     st.title("Preliminary Anti-Collision Tool")
 
@@ -885,10 +888,50 @@ st.info(
     "anti-collision analysis."
 )
 
-uploaded = st.file_uploader(
-    "Upload Offset Well Excel File",
-    type=["xlsx", "xls"],
-)
+def create_offset_well_template():
+    """Create a blank Excel template matching the required offset-well input format."""
+    bio = io.BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        pd.DataFrame(columns=["Well", "X", "Y", "Z"]).to_excel(
+            writer, sheet_name="Well_Header", index=False
+        )
+        pd.DataFrame(columns=["Well", "MD", "Inclination", "Azimuth"]).to_excel(
+            writer, sheet_name="Survey", index=False
+        )
+
+        # Light formatting so the template is immediately understandable.
+        wb = writer.book
+        for ws in [wb["Well_Header"], wb["Survey"]]:
+            ws.freeze_panes = "A2"
+            from openpyxl.styles import Font
+            for cell in ws[1]:
+                cell.font = Font(bold=True)
+            for column_cells in ws.columns:
+                max_len = max(len(str(cell.value or "")) for cell in column_cells)
+                ws.column_dimensions[column_cells[0].column_letter].width = max(12, max_len + 3)
+
+    bio.seek(0)
+    return bio.getvalue()
+
+
+template_data = create_offset_well_template()
+
+col_upload, col_template = st.columns([3, 1])
+with col_upload:
+    uploaded = st.file_uploader(
+        "Upload Offset Well Excel File",
+        type=["xlsx", "xls"],
+    )
+with col_template:
+    st.write("")
+    st.write("")
+    st.download_button(
+        label="📥 Download Excel Template",
+        data=template_data,
+        file_name="Offset_Well_Input_Template.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
 
 if uploaded:
     try:
