@@ -1,5 +1,6 @@
 import math
 import io
+import base64
 import numpy as np
 from math import sqrt, radians, degrees, acos, cos, sin, tan, atan2
 import pandas as pd
@@ -35,6 +36,7 @@ from trajectory import (
 # PDF REPORT GENERATOR
 # ----------------------------------------------------------------------
 REPORT_LOGO = str(__file__).replace("app.py", "rigsis_logo.png")
+APP_ICON = str(__file__).replace("app.py", "anti_collision_icon.png")
 
 
 def _fmt(v, decimals=2):
@@ -536,7 +538,16 @@ def generate_pdf_report(project, result, p3_detailed, uncertainty_result, phase3
         logo.drawWidth = 65*mm
         logo.drawHeight = 65*mm * 915/1531
         story.append(logo)
-        story.append(Spacer(1, 22*mm))
+        story.append(Spacer(1, 12*mm))
+
+    # Tool icon / favicon on the report cover.
+    if APP_ICON and __import__("os").path.exists(APP_ICON):
+        app_icon = RLImage(APP_ICON)
+        app_icon.drawWidth = 30*mm
+        app_icon.drawHeight = 30*mm
+        story.append(app_icon)
+        story.append(Spacer(1, 8*mm))
+
     story.append(Paragraph("PRELIMINARY", styles["ReportTitle"]))
     story.append(Paragraph("ANTI-COLLISION ASSESSMENT", styles["ReportTitle"]))
     story.append(Spacer(1, 8*mm))
@@ -837,11 +848,33 @@ def build_well_color_map(df):
     wells = list(dict.fromkeys(df["Well"].astype(str).tolist()))
     return {well: WELL_PALETTE[i % len(WELL_PALETTE)] for i, well in enumerate(wells)}
 
-st.set_page_config(page_title="Preliminary Anti-Collision Tool", page_icon="Favicon_AntCollision.png", layout="wide")
+st.set_page_config(
+    page_title="Preliminary Anti-Collision Tool",
+    page_icon=APP_ICON if __import__("os").path.exists(APP_ICON) else "⚠️",
+    layout="wide",
+)
 
-st.title("Preliminary Anti-Collision Tool")
+# Main application header with the same icon used as the browser favicon.
+if __import__("os").path.exists(APP_ICON):
+    with open(APP_ICON, "rb") as _icon_file:
+        _icon_b64 = base64.b64encode(_icon_file.read()).decode("ascii")
+    st.markdown(
+        f"""
+        <div style="display:flex; align-items:center; gap:14px; margin-bottom:2px;">
+            <img src="data:image/png;base64,{_icon_b64}"
+                 style="width:54px;height:54px;object-fit:contain;flex:0 0 auto;">
+            <div style="font-size:2.25rem;font-weight:700;line-height:1.15;">
+                Preliminary Anti-Collision Tool
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+else:
+    st.title("Preliminary Anti-Collision Tool")
+
 st.caption(
-    "Phase 1 — Offset Well Data | Phase 2 — New Well Trajectory | Phase 3 — Anti-Collision Analysis | developed by Didin Irwansyah for Rigsis Drilling Team"
+    "Phase 1 — Offset Well Data | Phase 2 — New Well Trajectory | Phase 3 — Anti-Collision Analysis"
 )
 
 st.info(
@@ -850,50 +883,10 @@ st.info(
     "anti-collision analysis."
 )
 
-def create_offset_well_template():
-    """Create a blank Excel template matching the required offset-well input format."""
-    bio = io.BytesIO()
-    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-        pd.DataFrame(columns=["Well", "X", "Y", "Z"]).to_excel(
-            writer, sheet_name="Well_Header", index=False
-        )
-        pd.DataFrame(columns=["Well", "MD", "Inclination", "Azimuth"]).to_excel(
-            writer, sheet_name="Survey", index=False
-        )
-
-        # Light formatting so the template is immediately understandable.
-        wb = writer.book
-        for ws in [wb["Well_Header"], wb["Survey"]]:
-            ws.freeze_panes = "A2"
-            from openpyxl.styles import Font
-            for cell in ws[1]:
-                cell.font = Font(bold=True)
-            for column_cells in ws.columns:
-                max_len = max(len(str(cell.value or "")) for cell in column_cells)
-                ws.column_dimensions[column_cells[0].column_letter].width = max(12, max_len + 3)
-
-    bio.seek(0)
-    return bio.getvalue()
-
-
-template_data = create_offset_well_template()
-
-col_upload, col_template = st.columns([3, 1])
-with col_upload:
-    uploaded = st.file_uploader(
-        "Upload Offset Well Excel File",
-        type=["xlsx", "xls"],
-    )
-with col_template:
-    st.write("")
-    st.write("")
-    st.download_button(
-        label="📥 Download Excel Template",
-        data=template_data,
-        file_name="Offset_Well_Input_Template.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-    )
+uploaded = st.file_uploader(
+    "Upload Offset Well Excel File",
+    type=["xlsx", "xls"],
+)
 
 if uploaded:
     try:
