@@ -1,6 +1,7 @@
 import math
 import io
 import base64
+import os
 import numpy as np
 from math import sqrt, radians, degrees, acos, cos, sin, tan, atan2
 import pandas as pd
@@ -35,8 +36,9 @@ from trajectory import (
 # ----------------------------------------------------------------------
 # PDF REPORT GENERATOR
 # ----------------------------------------------------------------------
-REPORT_LOGO = str(__file__).replace("app.py", "rigsis_logo.png")
-APP_ICON = str(__file__).replace("app.py", "anti_collision_icon.png")
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+REPORT_LOGO = os.path.join(APP_DIR, "rigsis_logo.png")
+APP_ICON = os.path.join(APP_DIR, "anti_collision_icon.png")
 
 
 def _fmt(v, decimals=2):
@@ -533,7 +535,7 @@ def generate_pdf_report(project, result, p3_detailed, uncertainty_result, phase3
 
     # Cover: deliberately no header/footer.
     story.append(Spacer(1, 25*mm))
-    if REPORT_LOGO and __import__("os").path.exists(REPORT_LOGO):
+    if REPORT_LOGO and os.path.exists(REPORT_LOGO):
         logo = RLImage(REPORT_LOGO)
         logo.drawWidth = 65*mm
         logo.drawHeight = 65*mm * 915/1531
@@ -541,7 +543,7 @@ def generate_pdf_report(project, result, p3_detailed, uncertainty_result, phase3
         story.append(Spacer(1, 12*mm))
 
     # Tool icon / favicon on the report cover.
-    if APP_ICON and __import__("os").path.exists(APP_ICON):
+    if APP_ICON and os.path.exists(APP_ICON):
         app_icon = RLImage(APP_ICON)
         app_icon.drawWidth = 30*mm
         app_icon.drawHeight = 30*mm
@@ -808,7 +810,7 @@ def generate_pdf_report(project, result, p3_detailed, uncertainty_result, phase3
         canvas.setFont("Helvetica-Bold", 9)
         canvas.setFillColor(colors.HexColor("#222222"))
         canvas.drawString(16*mm, h - 15*mm, "Preliminary Anti Collision Assessment")
-        if REPORT_LOGO and __import__("os").path.exists(REPORT_LOGO):
+        if REPORT_LOGO and os.path.exists(REPORT_LOGO):
             canvas.drawImage(REPORT_LOGO, w - 33.5*mm, h - 18.5*mm, width=15.75*mm, height=15.75*mm*915/1531, preserveAspectRatio=True, mask="auto")
         canvas.setStrokeColor(colors.HexColor("#B8B8B8")); canvas.setLineWidth(0.5)
         canvas.line(16*mm, h - 22*mm, w - 16*mm, h - 22*mm)
@@ -850,12 +852,12 @@ def build_well_color_map(df):
 
 st.set_page_config(
     page_title="Preliminary Anti-Collision Tool",
-    page_icon=APP_ICON if __import__("os").path.exists(APP_ICON) else "⚠️",
+    page_icon=APP_ICON if os.path.exists(APP_ICON) else "⚠️",
     layout="wide",
 )
 
 # Main application header with the same icon used as the browser favicon.
-if __import__("os").path.exists(APP_ICON):
+if os.path.exists(APP_ICON):
     with open(APP_ICON, "rb") as _icon_file:
         _icon_b64 = base64.b64encode(_icon_file.read()).decode("ascii")
     st.markdown(
