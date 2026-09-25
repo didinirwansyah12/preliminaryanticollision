@@ -837,7 +837,7 @@ def build_well_color_map(df):
     wells = list(dict.fromkeys(df["Well"].astype(str).tolist()))
     return {well: WELL_PALETTE[i % len(WELL_PALETTE)] for i, well in enumerate(wells)}
 
-st.set_page_config(page_title="Preliminary Anti-Collision Tool", layout="wide")
+st.set_page_config(page_title="Preliminary Anti-Collision Tool", page_icon="Favicon_AntCollision.png", layout="wide")
 
 st.title("Preliminary Anti-Collision Tool")
 st.caption(
