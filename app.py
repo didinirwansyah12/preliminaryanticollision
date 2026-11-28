@@ -3,6 +3,7 @@ import io
 import os
 import json
 import base64
+import importlib
 import numpy as np
 from math import sqrt, radians, degrees, acos, cos, sin, tan, atan2
 import pandas as pd
@@ -21,6 +22,8 @@ from reportlab.platypus import (
     SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak,
     Image as RLImage, KeepTogether
 )
+import trajectory
+importlib.reload(trajectory)
 from trajectory import (
     calculate_all_wells,
     add_depth_dependent_uncertainty,
@@ -1080,6 +1083,8 @@ def apply_saved_work(document):
         st.session_state.pop("result", None)
     st.session_state["recalculate_work"] = True
     st.session_state["saved_phase3"] = bool(document.get("phase3_was_run"))
+    st.session_state["work_restored"] = True
+    st.session_state["entry_mode"] = "upload"
     clear_downstream_results()
 
 
@@ -1171,8 +1176,52 @@ st.info(
     "anti-collision analysis."
 )
 
-work_col1, work_col2 = st.columns(2)
-with work_col1:
+@st.dialog("How do you want to start?", dismissible=False)
+def choose_start_dialog():
+    """First-step choice between a saved session and a new well."""
+    st.write("Upload a saved session, or analyze a new well from the input form.")
+    choice_left, choice_right = st.columns(2)
+    with choice_left:
+        if st.button("Upload previous work", use_container_width=True, key="choose_upload_previous"):
+            st.session_state["entry_mode"] = "upload"
+            st.session_state["work_restored"] = False
+            st.rerun()
+    with choice_right:
+        if st.button("Analyze new well", type="primary", use_container_width=True, key="choose_analyze_new"):
+            st.session_state["entry_mode"] = "new"
+            st.rerun()
+
+
+def _show_saved_work_uploader():
+    """JSON uploader for a previously downloaded session."""
+    work_file = st.file_uploader(
+        "Upload saved work",
+        type=["json"],
+        key="upload_saved_work",
+    )
+    if work_file is None:
+        return
+    work_id = getattr(work_file, "file_id", None) or f"{work_file.name}:{len(work_file.getvalue())}"
+    if st.session_state.get("loaded_work_file_id") == work_id:
+        return
+    try:
+        apply_saved_work(json.loads(work_file.getvalue().decode("utf-8")))
+        st.session_state["loaded_work_file_id"] = work_id
+        st.rerun()
+    except Exception as exc:
+        st.error(f"Saved work could not be restored: {exc}")
+
+
+if not st.session_state.get("entry_mode"):
+    choose_start_dialog()
+    st.stop()
+
+start_bar, download_bar = st.columns([1, 2])
+with start_bar:
+    if st.button("Start over", key="start_over", use_container_width=True):
+        st.session_state.pop("entry_mode", None)
+        st.rerun()
+with download_bar:
     st.download_button(
         "Download work",
         data=json.dumps(build_saved_work(), indent=2).encode("utf-8"),
@@ -1181,21 +1230,15 @@ with work_col1:
         key="download_work",
         use_container_width=True,
     )
-with work_col2:
-    work_file = st.file_uploader(
-        "Upload saved work",
-        type=["json"],
-        key="upload_saved_work",
-    )
-if work_file is not None:
-    work_id = getattr(work_file, "file_id", None) or f"{work_file.name}:{len(work_file.getvalue())}"
-    if st.session_state.get("loaded_work_file_id") != work_id:
-        try:
-            apply_saved_work(json.loads(work_file.getvalue().decode("utf-8")))
-            st.session_state["loaded_work_file_id"] = work_id
-            st.rerun()
-        except Exception as exc:
-            st.error(f"Saved work could not be restored: {exc}")
+
+if st.session_state.get("entry_mode") == "upload" and not st.session_state.get("work_restored"):
+    st.subheader("Upload previous work")
+    st.caption("Choose the JSON file saved with Download work. The inputs are restored and the well is recalculated.")
+    _show_saved_work_uploader()
+    if st.button("Analyze new well instead", key="switch_to_new_well"):
+        st.session_state["entry_mode"] = "new"
+        st.rerun()
+    st.stop()
 
 def create_offset_well_template():
     """Create a blank Excel template matching the required offset-well input format."""
