@@ -891,8 +891,8 @@ def clear_downstream_results():
         st.session_state.pop(key, None)
 
 
-def store_new_well_trajectory(summary, detailed, info, inputs, geom, survey, surface_xyz, source):
-    """Save a new-well design and the un-nudged survey it can be restored from."""
+def store_new_well_trajectory(summary, detailed, info, inputs, geom, survey, surface_xyz, source, nudge=None):
+    """Save a new-well design. ``nudge`` is the design nudge applied with that calculation."""
     st.session_state["p3_summary"] = summary
     st.session_state["p3_detailed"] = detailed
     st.session_state["p3_info"] = info
@@ -906,8 +906,95 @@ def store_new_well_trajectory(summary, detailed, info, inputs, geom, survey, sur
     st.session_state["p3_base_geom"] = dict(geom)
     st.session_state["p3_base_survey"] = survey[["MD", "Inclination", "Azimuth"]].copy()
     st.session_state["p3_base_surface"] = tuple(float(v) for v in surface_xyz)
-    st.session_state["p3_nudge"] = None
+    st.session_state["p3_nudge"] = dict(nudge) if nudge else None
     clear_downstream_results()
+
+
+def validate_nudge_md(params, md_min, md_max):
+    """Reject a nudge that does not fit inside the design survey."""
+    start = float(params["start_md"])
+    length = float(params["nudge_length"])
+    return_length = float(params["return_length"])
+    bur = float(params["bur"])
+    end = start + length + return_length
+    span = f"{float(md_min):.2f}–{float(md_max):.2f} m"
+    if length <= 0 or return_length <= 0:
+        raise ValueError("Nudge length and return length must be greater than 0 m.")
+    if bur <= 0:
+        raise ValueError("Nudge BUR must be greater than 0 deg/30 m.")
+    if start < float(md_min) - 1e-6 or start >= float(md_max) - 1e-6:
+        raise ValueError(
+            f"Nudge start MD {start:.2f} m is outside the design MD range {span}. "
+            "Start at or after the first station and above TD."
+        )
+    if end > float(md_max) + 1e-6:
+        raise ValueError(
+            f"Nudge plus return ends at MD {end:.2f} m, past the design TD {float(md_max):.2f} m. "
+            f"The design MD range is {span}. Shorten the nudge or extend TD."
+        )
+
+
+def render_enable_nudging(md_min=None, md_max=None):
+    """Design-time nudge controls. Returns ``(enabled, params)``."""
+    enabled = st.checkbox("Enable nudging", key="p3_enable_nudge")
+    if not enabled:
+        return False, None
+    st.caption(
+        "Walk the design off its plan, then steer back to the original "
+        "inclination and azimuth. The nudge is applied when the trajectory is calculated."
+    )
+    if md_min is not None and md_max is not None:
+        st.caption(f"Design survey MD range: {float(md_min):.2f} m to {float(md_max):.2f} m.")
+    nudge_c1, nudge_c2, nudge_c3 = st.columns(3)
+    with nudge_c1:
+        direction = st.selectbox(
+            "Direction",
+            ["Right", "Left", "Build", "Drop"],
+            key="p3_nudge_direction",
+            help="Right increases azimuth, Left decreases it. Build increases inclination, Drop decreases it.",
+        )
+        bur = st.number_input(
+            "Nudge BUR (deg/30m)",
+            min_value=0.1,
+            value=2.0,
+            step=0.1,
+            format="%.2f",
+            key="p3_nudge_bur",
+        )
+    with nudge_c2:
+        start_md = st.number_input(
+            "Start MD (m)",
+            min_value=0.0,
+            value=300.0,
+            step=10.0,
+            format="%.2f",
+            key="p3_nudge_start",
+        )
+        nudge_length = st.number_input(
+            "Nudge length (m)",
+            min_value=1.0,
+            value=30.0,
+            step=5.0,
+            format="%.2f",
+            key="p3_nudge_length",
+        )
+    with nudge_c3:
+        return_length = st.number_input(
+            "Return length (m)",
+            min_value=1.0,
+            value=60.0,
+            step=5.0,
+            format="%.2f",
+            key="p3_nudge_return",
+            help="Length available to restore the original inclination and azimuth. BUR is the maximum dogleg.",
+        )
+    return True, {
+        "direction": str(direction).lower(),
+        "bur": float(bur),
+        "start_md": float(start_md),
+        "nudge_length": float(nudge_length),
+        "return_length": float(return_length),
+    }
 
 
 def _mark_nearest(detailed, md, label):
@@ -1180,7 +1267,7 @@ with st.expander("Phase 2 — New Well Trajectory", expanded=False):
         "Generate a preliminary J-Type trajectory, or upload a design survey "
         "in the same Excel template used for the offset wells. "
         "Header X is Easting, header Y is Northing, and Z is surface elevation. "
-        "After a design exists, a nudge can walk the well off the plan and "
+        "Enable nudging while designing the well to walk it off the plan and "
         "back onto the original inclination and azimuth."
     )
 
@@ -1239,6 +1326,10 @@ with st.expander("Phase 2 — New Well Trajectory", expanded=False):
                     design_survey["Well"].astype(str).str.strip() == design_well
                 ]
                 st.dataframe(preview, use_container_width=True, hide_index=True)
+                preview_md = pd.to_numeric(preview.get("MD"), errors="coerce").dropna()
+                upload_md_min = float(preview_md.min()) if not preview_md.empty else None
+                upload_md_max = float(preview_md.max()) if not preview_md.empty else None
+                upload_nudge_on, upload_nudge = render_enable_nudging(upload_md_min, upload_md_max)
                 if st.button(
                     "Use uploaded trajectory",
                     type="primary",
@@ -1280,17 +1371,41 @@ with st.expander("Phase 2 — New Well Trajectory", expanded=False):
                         "Target Depth (mASL)": float(last["TVDSS"]),
                         "Calculation Method": "Uploaded survey (minimum curvature)",
                     }
-                    store_new_well_trajectory(
-                        summary, detailed, info, inputs, geom, survey, surface,
-                        "Excel upload",
-                    )
-                    first_md = float(survey["MD"].min())
-                    if first_md > 0.5:
-                        st.warning(
-                            f"The survey starts at MD {first_md:.2f} m rather than at surface (MD 0). "
-                            "TVD is measured from the first station, the same rule used for offset wells."
+                    nudge_applied = None
+                    nudge_failed = False
+                    if upload_nudge_on:
+                        try:
+                            validate_nudge_md(
+                                upload_nudge,
+                                float(survey["MD"].min()),
+                                float(survey["MD"].max()),
+                            )
+                            summary, detailed, info, inputs = rebuild_nudged_trajectory(
+                                survey, surface, upload_nudge, inputs
+                            )
+                            nudge_applied = upload_nudge
+                        except Exception as exc:
+                            nudge_failed = True
+                            st.error(f"Nudging tidak dapat diterapkan: {exc}")
+                    if not nudge_failed:
+                        store_new_well_trajectory(
+                            summary, detailed, info, inputs, geom, survey, surface,
+                            "Excel upload",
+                            nudge=nudge_applied,
                         )
-                    st.success(f"Uploaded trajectory for {design_well} is now the new well.")
+                        first_md = float(survey["MD"].min())
+                        if first_md > 0.5:
+                            st.warning(
+                                f"The survey starts at MD {first_md:.2f} m rather than at surface (MD 0). "
+                                "TVD is measured from the first station, the same rule used for offset wells."
+                            )
+                        if nudge_applied:
+                            st.success(
+                                f"Uploaded trajectory for {design_well} is now the new well, "
+                                f"with a {nudge_applied['direction']} nudge from MD {nudge_applied['start_md']:.2f} m."
+                            )
+                        else:
+                            st.success(f"Uploaded trajectory for {design_well} is now the new well.")
             except Exception as exc:
                 st.error(f"Design workbook problem: {exc}")
 
@@ -1794,6 +1909,8 @@ with st.expander("Phase 2 — New Well Trajectory", expanded=False):
                 p3_kop = None
                 st.error(str(exc))
 
+        p3_nudge_on, p3_nudge_params = render_enable_nudging()
+
         st.subheader("4. Total Depth (TD) Settings")
 
         p3_td_mode = st.radio(
@@ -1870,151 +1987,45 @@ with st.expander("Phase 2 — New Well Trajectory", expanded=False):
                     p3_surface_n, p3_surface_e, p3_rkb,
                     p3_target_n, p3_target_e, p3_target_z,
                 )
-                store_new_well_trajectory(
-                    p3_summary,
-                    p3_detailed,
-                    p3_info,
-                    p3_inputs,
-                    geom,
-                    p3_detailed[["MD", "Inclination", "Azimuth"]],
-                    (
-                        float(p3_detailed.iloc[0]["Easting"]),
-                        float(p3_detailed.iloc[0]["Northing"]),
-                        float(p3_detailed.iloc[0]["TVDSS"]),
-                    ),
-                    "J-Type design",
+                design_survey = p3_detailed[["MD", "Inclination", "Azimuth"]].copy()
+                design_surface = (
+                    float(p3_detailed.iloc[0]["Easting"]),
+                    float(p3_detailed.iloc[0]["Northing"]),
+                    float(p3_detailed.iloc[0]["TVDSS"]),
                 )
+                nudge_applied = None
+                nudge_failed = False
+                if p3_nudge_on:
+                    try:
+                        validate_nudge_md(
+                            p3_nudge_params,
+                            float(design_survey["MD"].min()),
+                            float(design_survey["MD"].max()),
+                        )
+                        p3_summary, p3_detailed, p3_info, p3_inputs = rebuild_nudged_trajectory(
+                            design_survey, design_surface, p3_nudge_params, p3_inputs
+                        )
+                        nudge_applied = p3_nudge_params
+                    except Exception as exc:
+                        nudge_failed = True
+                        st.error(f"Nudging tidak dapat diterapkan: {exc}")
+                if not nudge_failed:
+                    store_new_well_trajectory(
+                        p3_summary,
+                        p3_detailed,
+                        p3_info,
+                        p3_inputs,
+                        geom,
+                        design_survey,
+                        design_surface,
+                        "J-Type design",
+                        nudge=nudge_applied,
+                    )
 
             except Exception as exc:
                 st.error(f"Trajectory tidak dapat dibuat: {exc}")
 
     if "p3_summary" in st.session_state and "p3_geom" in st.session_state:
-
-        with st.expander("Nudging", expanded=False):
-            st.caption(
-                "Walk the design off its plan, then steer back to the original "
-                "inclination and azimuth. The path is recalculated with minimum "
-                "curvature. Below the return, stations keep the original attitude, "
-                "so the well runs parallel to the design. "
-                "A new nudge replaces the previous one. It is not stacked."
-            )
-            base_survey = st.session_state.get("p3_base_survey")
-            if base_survey is None or base_survey.empty:
-                st.info("Calculate or upload a trajectory before applying a nudge.")
-            else:
-                md_min = float(base_survey["MD"].min())
-                md_max = float(base_survey["MD"].max())
-                st.caption(f"Design survey MD range: {md_min:.2f} m to {md_max:.2f} m.")
-                nudge_c1, nudge_c2, nudge_c3 = st.columns(3)
-                with nudge_c1:
-                    nudge_direction = st.selectbox(
-                        "Direction",
-                        ["Right", "Left", "Build", "Drop"],
-                        key="p3_nudge_direction",
-                        help="Right increases azimuth, Left decreases it. Build increases inclination, Drop decreases it.",
-                    )
-                    nudge_bur = st.number_input(
-                        "Nudge BUR (deg/30m)",
-                        min_value=0.1,
-                        value=2.0,
-                        step=0.1,
-                        format="%.2f",
-                        key="p3_nudge_bur",
-                    )
-                with nudge_c2:
-                    nudge_start = st.number_input(
-                        "Start MD (m)",
-                        min_value=0.0,
-                        value=300.0,
-                        step=10.0,
-                        format="%.2f",
-                        key="p3_nudge_start",
-                    )
-                    nudge_length = st.number_input(
-                        "Nudge length (m)",
-                        min_value=1.0,
-                        value=30.0,
-                        step=5.0,
-                        format="%.2f",
-                        key="p3_nudge_length",
-                    )
-                with nudge_c3:
-                    nudge_return = st.number_input(
-                        "Return length (m)",
-                        min_value=1.0,
-                        value=60.0,
-                        step=5.0,
-                        format="%.2f",
-                        key="p3_nudge_return",
-                        help="Length available to restore the original inclination and azimuth. BUR is the maximum dogleg.",
-                    )
-                nudge_b1, nudge_b2 = st.columns(2)
-                nudge_message = None
-                nudge_error = None
-                with nudge_b1:
-                    apply_nudge = st.button(
-                        "Apply nudge",
-                        type="primary",
-                        use_container_width=True,
-                        key="p3_apply_nudge",
-                    )
-                if apply_nudge:
-                    nudge_params = {
-                        "direction": nudge_direction.lower(),
-                        "bur": float(nudge_bur),
-                        "start_md": float(nudge_start),
-                        "nudge_length": float(nudge_length),
-                        "return_length": float(nudge_return),
-                    }
-                    try:
-                        nudged_summary, nudged_detailed, nudged_info, nudged_inputs = (
-                            rebuild_nudged_trajectory(
-                                st.session_state["p3_base_survey"],
-                                st.session_state["p3_base_surface"],
-                                nudge_params,
-                                st.session_state["p3_base_inputs"],
-                            )
-                        )
-                        st.session_state["p3_summary"] = nudged_summary
-                        st.session_state["p3_detailed"] = nudged_detailed
-                        st.session_state["p3_info"] = nudged_info
-                        st.session_state["p3_inputs"] = nudged_inputs
-                        st.session_state["p3_nudge"] = nudge_params
-                        clear_downstream_results()
-                        nudge_message = (
-                            f"Nudge applied: {nudge_direction} at {nudge_bur:.2f} deg/30m "
-                            f"from MD {nudge_start:.2f} m."
-                        )
-                    except Exception as exc:
-                        nudge_error = f"Nudge tidak dapat diterapkan: {exc}"
-                with nudge_b2:
-                    clear_nudge = st.button(
-                        "Remove nudge",
-                        use_container_width=True,
-                        key="p3_clear_nudge",
-                        disabled=not bool(st.session_state.get("p3_nudge")),
-                    )
-                if clear_nudge and st.session_state.get("p3_nudge"):
-                    st.session_state["p3_summary"] = st.session_state["p3_base_summary"].copy()
-                    st.session_state["p3_detailed"] = st.session_state["p3_base_detailed"].copy()
-                    st.session_state["p3_info"] = dict(st.session_state["p3_base_info"])
-                    st.session_state["p3_inputs"] = dict(st.session_state["p3_base_inputs"])
-                    st.session_state["p3_geom"] = dict(st.session_state["p3_base_geom"])
-                    st.session_state["p3_nudge"] = None
-                    clear_downstream_results()
-                    nudge_message = "Nudge removed. The original design trajectory is restored."
-                if nudge_error:
-                    st.error(nudge_error)
-                elif nudge_message:
-                    st.success(nudge_message)
-                active_nudge = st.session_state.get("p3_nudge")
-                if active_nudge:
-                    st.info(
-                        f"Active nudge: {active_nudge['direction']} at "
-                        f"{active_nudge['bur']:.2f} deg/30m from MD {active_nudge['start_md']:.2f} m "
-                        f"for {active_nudge['nudge_length']:.2f} m, "
-                        f"return {active_nudge['return_length']:.2f} m."
-                    )
 
         p3_summary = st.session_state["p3_summary"]
         p3_detailed = st.session_state["p3_detailed"]
