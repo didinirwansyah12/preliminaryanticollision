@@ -752,3 +752,291 @@ def error_envelope_tube_from_path(path, n_ring=16):
             j_idx.extend([r1[kn], r0[kn]])
             k_idx.extend([r0[kn], r1[kn]])
     return vertices, i_idx, j_idx, k_idx, path
+
+
+# ----------------------------------------------------------------------
+# New-well design upload and nudging
+# ----------------------------------------------------------------------
+
+PHASE2_SUMMARY_COLUMNS = [
+    "Parameter", "MD", "TVD", "Inc", "Azimuth",
+    "N+", "E+", "Northing", "Easting",
+    "Displacement", "TVDSS", "BUR",
+]
+
+_NUDGE_TOOLFACE = {
+    "build": 0.0,
+    "right": 90.0,
+    "drop": 180.0,
+    "left": 270.0,
+}
+
+
+def _wrap180(angle_deg):
+    return (float(angle_deg) + 180.0) % 360.0 - 180.0
+
+
+def _dogleg_deg(inc1, azi1, inc2, azi2):
+    i1 = math.radians(float(inc1))
+    i2 = math.radians(float(inc2))
+    da = math.radians(_wrap180(float(azi2) - float(azi1)))
+    value = math.cos(i1) * math.cos(i2) + math.sin(i1) * math.sin(i2) * math.cos(da)
+    value = max(-1.0, min(1.0, value))
+    return math.degrees(math.acos(value))
+
+
+def _interp_inc_azi(mds, incs, azis, md):
+    md = float(md)
+    if md <= float(mds[0]):
+        return float(incs[0]), float(azis[0]) % 360.0
+    if md >= float(mds[-1]):
+        return float(incs[-1]), float(azis[-1]) % 360.0
+    i = int(np.searchsorted(mds, md) - 1)
+    span = float(mds[i + 1] - mds[i])
+    t = 0.0 if span <= 1e-12 else (md - float(mds[i])) / span
+    inc = float(incs[i]) + t * (float(incs[i + 1]) - float(incs[i]))
+    azi = (float(azis[i]) + t * _wrap180(float(azis[i + 1]) - float(azis[i]))) % 360.0
+    return inc, azi
+
+
+def phase2_frame_from_calculated(calc_df, surface_easting, surface_northing):
+    """Map a minimum-curvature result into the Phase 2 detailed-survey columns.
+
+    Minimum curvature stores X as Easting and Y as Northing.
+    """
+    calc = calc_df.reset_index(drop=True)
+    n_plus = calc["Y"].astype(float) - float(surface_northing)
+    e_plus = calc["X"].astype(float) - float(surface_easting)
+    bur = calc["DLS"].astype(float) if "DLS" in calc.columns else 0.0
+    return pd.DataFrame({
+        "MD": calc["MD"].astype(float),
+        "TVD": calc["TVD"].astype(float),
+        "Inclination": calc["Inclination"].astype(float),
+        "Azimuth": calc["Azimuth"].astype(float),
+        "N+": n_plus,
+        "E+": e_plus,
+        "Northing": calc["Y"].astype(float),
+        "Easting": calc["X"].astype(float),
+        "Displacement": np.hypot(n_plus.to_numpy(), e_plus.to_numpy()),
+        "TVDSS": calc["Z"].astype(float),
+        "BUR": bur,
+        "Parameter": "Survey",
+    })
+
+
+def phase2_summary_from_frame(detailed, markers):
+    """Build the Phase 2 summary table from labeled measured depths."""
+    rows = []
+    for label, md in markers:
+        idx = (detailed["MD"] - float(md)).abs().idxmin()
+        r = detailed.loc[idx]
+        rows.append([
+            label,
+            float(r["MD"]), float(r["TVD"]), float(r["Inclination"]), float(r["Azimuth"]),
+            float(r["N+"]), float(r["E+"]), float(r["Northing"]), float(r["Easting"]),
+            float(r["Displacement"]), float(r["TVDSS"]), float(r["BUR"]),
+        ])
+    return pd.DataFrame(rows, columns=PHASE2_SUMMARY_COLUMNS)
+
+
+def load_design_well(header_df, survey_df, well_name):
+    """Load one well from the offset-well workbook and calculate its path.
+
+    Well_Header columns are Well, X, Y, Z. X is Easting, Y is Northing and
+    Z is the surface elevation used as the TVD datum. Survey columns are
+    Well, MD, Inclination, Azimuth. The path uses minimum curvature.
+    """
+    header = header_df.copy()
+    survey = survey_df.copy()
+    header.columns = [str(c).strip() for c in header.columns]
+    survey.columns = [str(c).strip() for c in survey.columns]
+
+    missing_h = [c for c in ("Well", "X", "Y", "Z") if c not in header.columns]
+    missing_s = [c for c in ("Well", "MD", "Inclination", "Azimuth") if c not in survey.columns]
+    if missing_h or missing_s:
+        raise ValueError(
+            "Workbook does not match the offset-well template. "
+            f"Well_Header missing: {', '.join(missing_h) or 'none'}. "
+            f"Survey missing: {', '.join(missing_s) or 'none'}."
+        )
+
+    well_name = str(well_name).strip()
+    header["Well"] = header["Well"].astype(str).str.strip()
+    survey["Well"] = survey["Well"].astype(str).str.strip()
+    header_row = header[header["Well"] == well_name]
+    survey = survey[survey["Well"] == well_name].copy()
+    if header_row.empty:
+        raise ValueError(f"No Well_Header row for {well_name}.")
+    if survey.empty:
+        raise ValueError(f"No Survey rows for {well_name}.")
+
+    try:
+        surface_e = float(header_row.iloc[0]["X"])
+        surface_n = float(header_row.iloc[0]["Y"])
+        surface_z = float(header_row.iloc[0]["Z"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Well_Header X, Y and Z must be numbers.") from exc
+
+    for col in ("MD", "Inclination", "Azimuth"):
+        survey[col] = pd.to_numeric(survey[col], errors="coerce")
+    survey = survey.dropna(subset=["MD", "Inclination", "Azimuth"])
+    if survey.empty:
+        raise ValueError(f"Survey rows for {well_name} have no numeric MD, inclination and azimuth.")
+
+    calc = minimum_curvature(survey, surface_e, surface_n, surface_z)
+    detailed = phase2_frame_from_calculated(calc, surface_e, surface_n)
+    detailed.loc[detailed.index[0], "Parameter"] = "RKB"
+    detailed.loc[detailed.index[-1], "Parameter"] = "TD"
+    base_survey = calc[["MD", "Inclination", "Azimuth"]].copy()
+    return detailed, base_survey, (surface_e, surface_n, surface_z)
+
+
+def _steer_step(inc, azi, delta_md, bur, toolface_deg):
+    """Advance one station at a constant dogleg severity and toolface."""
+    kappa = math.radians(float(bur)) / 30.0
+    tf = math.radians(float(toolface_deg))
+    new_inc = float(inc) + math.degrees(kappa * delta_md * math.cos(tf))
+    turning = abs(math.sin(tf)) > 1e-8
+    if turning and min(float(inc), new_inc) <= 0.5:
+        raise ValueError(
+            "A left or right nudge needs inclination above about 0.5°. "
+            "Use Build to create inclination before turning."
+        )
+    if new_inc <= 0.05 or new_inc >= 179.95:
+        raise ValueError(
+            "Nudge would drive inclination outside 0–180°. "
+            "Reduce the BUR or the nudge length, or start where inclination is already established."
+        )
+    sin_avg = math.sin(math.radians((float(inc) + new_inc) / 2.0))
+    d_azi = 0.0 if sin_avg < 1e-8 else math.degrees(kappa * delta_md * math.sin(tf) / sin_avg)
+    new_azi = (float(azi) + d_azi) % 360.0
+    return new_inc, new_azi
+
+
+def nudge_survey(
+    survey_df,
+    start_md,
+    nudge_length,
+    return_length,
+    bur,
+    direction,
+    step_md=5.0,
+):
+    """Steer off the design survey, then restore the original attitude.
+
+    ``direction`` is one of ``build``, ``drop``, ``left`` or ``right``.
+    The nudge holds the requested BUR for ``nudge_length`` metres starting
+    at ``start_md``. The return section steers back so inclination and
+    azimuth match the original survey at the end of the return. Stations
+    below that depth keep the original inclination and azimuth, which
+    leaves the deeper well parallel to the design.
+
+    Returns a survey with columns MD, Inclination and Azimuth.
+    """
+    direction_key = str(direction).strip().lower()
+    if direction_key not in _NUDGE_TOOLFACE:
+        raise ValueError("Nudge direction must be build, drop, left or right.")
+
+    work = survey_df.copy()
+    required = ["MD", "Inclination", "Azimuth"]
+    missing = [c for c in required if c not in work.columns]
+    if missing:
+        raise ValueError(f"Survey is missing columns: {', '.join(missing)}")
+    for col in required:
+        work[col] = pd.to_numeric(work[col], errors="coerce")
+    work = work.dropna(subset=required).sort_values("MD").drop_duplicates("MD").reset_index(drop=True)
+    if len(work) < 2:
+        raise ValueError("At least two survey stations are required to nudge a trajectory.")
+
+    start_md = float(start_md)
+    nudge_length = float(nudge_length)
+    return_length = float(return_length)
+    bur = float(bur)
+    step_md = float(step_md)
+    if nudge_length <= 0 or return_length <= 0:
+        raise ValueError("Nudge length and return length must be greater than 0 m.")
+    if bur <= 0:
+        raise ValueError("BUR must be greater than 0 deg/30 m.")
+    if step_md <= 0:
+        raise ValueError("Nudge step must be greater than 0 m.")
+
+    mds = work["MD"].to_numpy(dtype=float)
+    incs = work["Inclination"].to_numpy(dtype=float)
+    azis = work["Azimuth"].to_numpy(dtype=float)
+    td = float(mds[-1])
+    nudge_end = start_md + nudge_length
+    return_end = nudge_end + return_length
+    if start_md < float(mds[0]) - 1e-6:
+        raise ValueError(f"Nudge start MD must be at or below the first station ({mds[0]:.2f} m).")
+    if start_md >= td - 1e-6:
+        raise ValueError("Nudge start MD must be above TD.")
+    if return_end > td + 1e-6:
+        raise ValueError(
+            f"Nudge plus return ends at MD {return_end:.2f} m, past TD {td:.2f} m. "
+            "Shorten the nudge or extend TD."
+        )
+
+    def _md_steps(md0, md1):
+        count = max(1, int(math.ceil((md1 - md0) / step_md - 1e-9)))
+        return [md0 + (md1 - md0) * (i + 1) / count for i in range(count)]
+
+    stations = []
+    for md, inc, azi in zip(mds, incs, azis):
+        if float(md) < start_md - 1e-6:
+            stations.append((float(md), float(inc), float(azi) % 360.0))
+    inc, azi = _interp_inc_azi(mds, incs, azis, start_md)
+    stations.append((start_md, inc, azi))
+
+    toolface = _NUDGE_TOOLFACE[direction_key]
+    for md in _md_steps(start_md, nudge_end):
+        prev_md, inc, azi = stations[-1]
+        inc, azi = _steer_step(inc, azi, md - prev_md, bur, toolface)
+        stations.append((md, inc, azi))
+
+    target_inc, target_azi = _interp_inc_azi(mds, incs, azis, return_end)
+    away_inc, away_azi = stations[-1][1], stations[-1][2]
+    required = _dogleg_deg(away_inc, away_azi, target_inc, target_azi)
+    available = bur * return_length / 30.0
+    if required > available + 0.05:
+        raise ValueError(
+            f"Return cannot restore the original attitude. Required dogleg is {required:.2f}°, "
+            f"but {return_length:.1f} m at {bur:.2f}°/30 m can deliver {available:.2f}°. "
+            "Increase the return length or the BUR."
+        )
+
+    for md in _md_steps(nudge_end, return_end):
+        prev_md, inc, azi = stations[-1]
+        remain = return_end - prev_md
+        step = md - prev_md
+        if remain <= step + 1e-8:
+            stations.append((return_end, target_inc, target_azi % 360.0))
+            break
+        hs = math.radians(target_inc - inc)
+        sin_avg = math.sin(math.radians(max((inc + target_inc) / 2.0, 0.2)))
+        rs = sin_avg * math.radians(_wrap180(target_azi - azi))
+        phi = math.hypot(hs, rs)
+        if phi < 1e-10:
+            stations.append((md, target_inc, target_azi % 360.0))
+            continue
+        kappa = min(phi / remain, math.radians(bur) / 30.0)
+        tf = math.atan2(rs, hs)
+        new_inc = inc + math.degrees(kappa * step * math.cos(tf))
+        if new_inc <= 0.05 or new_inc >= 179.95:
+            raise ValueError(
+                "Return would drive inclination outside 0–180°. "
+                "Increase the return length or reduce the nudge."
+            )
+        sin_step = math.sin(math.radians((inc + new_inc) / 2.0))
+        d_azi = 0.0 if sin_step < 1e-8 else math.degrees(kappa * step * math.sin(tf) / sin_step)
+        stations.append((md, new_inc, (azi + d_azi) % 360.0))
+
+    for md, inc, azi in zip(mds, incs, azis):
+        if float(md) > return_end + 1e-6:
+            stations.append((float(md), float(inc), float(azi) % 360.0))
+
+    out = pd.DataFrame(stations, columns=["MD", "Inclination", "Azimuth"])
+    out["MD"] = out["MD"].round(6)
+    out = out.drop_duplicates("MD", keep="last").sort_values("MD").reset_index(drop=True)
+    if (out["MD"].diff().dropna() <= 0).any():
+        raise ValueError("Nudge produced a survey whose MD does not increase.")
+    return out
