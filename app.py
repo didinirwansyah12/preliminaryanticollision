@@ -1176,22 +1176,6 @@ st.info(
     "anti-collision analysis."
 )
 
-@st.dialog("How do you want to start?", dismissible=False)
-def choose_start_dialog():
-    """First-step choice between a saved session and a new well."""
-    st.write("Upload a saved session, or analyze a new well from the input form.")
-    choice_left, choice_right = st.columns(2)
-    with choice_left:
-        if st.button("Upload previous work", use_container_width=True, key="choose_upload_previous"):
-            st.session_state["entry_mode"] = "upload"
-            st.session_state["work_restored"] = False
-            st.rerun()
-    with choice_right:
-        if st.button("Analyze new well", type="primary", use_container_width=True, key="choose_analyze_new"):
-            st.session_state["entry_mode"] = "new"
-            st.rerun()
-
-
 def _show_saved_work_uploader():
     """JSON uploader for a previously downloaded session."""
     work_file = st.file_uploader(
@@ -1213,7 +1197,16 @@ def _show_saved_work_uploader():
 
 
 if not st.session_state.get("entry_mode"):
-    choose_start_dialog()
+    choice_left, choice_right = st.columns(2)
+    with choice_left:
+        if st.button("Upload previous work", use_container_width=True, key="choose_upload_previous"):
+            st.session_state["entry_mode"] = "upload"
+            st.session_state["work_restored"] = False
+            st.rerun()
+    with choice_right:
+        if st.button("Analyze new well", type="primary", use_container_width=True, key="choose_analyze_new"):
+            st.session_state["entry_mode"] = "new"
+            st.rerun()
     st.stop()
 
 start_bar, download_bar = st.columns([1, 2])
@@ -1235,9 +1228,6 @@ if st.session_state.get("entry_mode") == "upload" and not st.session_state.get("
     st.subheader("Upload previous work")
     st.caption("Choose the JSON file saved with Download work. The inputs are restored and the well is recalculated.")
     _show_saved_work_uploader()
-    if st.button("Analyze new well instead", key="switch_to_new_well"):
-        st.session_state["entry_mode"] = "new"
-        st.rerun()
     st.stop()
 
 def create_offset_well_template():
