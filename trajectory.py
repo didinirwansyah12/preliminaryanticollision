@@ -1040,3 +1040,523 @@ def nudge_survey(
     if (out["MD"].diff().dropna() <= 0).any():
         raise ValueError("Nudge produced a survey whose MD does not increase.")
     return out
+
+
+# ----------------------------------------------------------------------
+# Nudge, then connect to the main J-type design
+# ----------------------------------------------------------------------
+
+_NUDGE_CLOSURE_M = 0.5
+
+
+def _dogleg_rad_arrays(inc1, azi1, inc2, azi2):
+    """Dogleg in radians. Angles are in radians. Inputs may be arrays."""
+    val = (
+        np.cos(inc1) * np.cos(inc2)
+        + np.sin(inc1) * np.sin(inc2) * np.cos(azi2 - azi1)
+    )
+    return np.arccos(np.clip(val, -1.0, 1.0))
+
+
+def _arc_displacement(inc1, azi1, inc2, azi2, length):
+    """North, East and TVD change along one minimum-curvature arc.
+
+    Angles are radians. ``length`` is measured depth along the arc.
+    """
+    phi = _dogleg_rad_arrays(inc1, azi1, inc2, azi2)
+    tiny = np.abs(phi) < 1e-10
+    rf = np.ones_like(phi, dtype=float)
+    rf = np.where(tiny, 1.0, (2.0 / np.where(tiny, 1.0, phi)) * np.tan(np.where(tiny, 0.0, phi) / 2.0))
+    # A zero-length or zero-dogleg step follows the starting attitude.
+    straight_n = length * np.sin(inc1) * np.cos(azi1)
+    straight_e = length * np.sin(inc1) * np.sin(azi1)
+    straight_v = length * np.cos(inc1)
+    d_n = (length / 2.0) * (np.sin(inc1) * np.cos(azi1) + np.sin(inc2) * np.cos(azi2)) * rf
+    d_e = (length / 2.0) * (np.sin(inc1) * np.sin(azi1) + np.sin(inc2) * np.sin(azi2)) * rf
+    d_v = (length / 2.0) * (np.cos(inc1) + np.cos(inc2)) * rf
+    use_straight = tiny | (np.abs(length) < 1e-12)
+    return (
+        np.where(use_straight, straight_n, d_n),
+        np.where(use_straight, straight_e, d_e),
+        np.where(use_straight, straight_v, d_v),
+    )
+
+
+def _attitude_along_arc(inc1, azi1, inc2, azi2, fraction):
+    """Inclination and azimuth, in degrees, at a fraction of a constant-curvature arc."""
+    i1, a1 = math.radians(inc1), math.radians(azi1)
+    i2, a2 = math.radians(inc2), math.radians(azi2)
+    t1 = np.array([math.sin(i1) * math.cos(a1), math.sin(i1) * math.sin(a1), math.cos(i1)])
+    t2 = np.array([math.sin(i2) * math.cos(a2), math.sin(i2) * math.sin(a2), math.cos(i2)])
+    phi = float(_dogleg_rad_arrays(i1, a1, i2, a2))
+    s = min(1.0, max(0.0, float(fraction)))
+    if phi < 1e-10:
+        tangent = t1
+    else:
+        tangent = (math.sin((1.0 - s) * phi) * t1 + math.sin(s * phi) * t2) / math.sin(phi)
+    norm = float(np.linalg.norm(tangent))
+    if norm < 1e-12:
+        tangent = t1
+    else:
+        tangent = tangent / norm
+    inc = math.degrees(math.acos(min(1.0, max(-1.0, float(tangent[2])))))
+    azi = math.degrees(math.atan2(float(tangent[1]), float(tangent[0]))) % 360.0
+    return inc, azi
+
+
+def _nudge_section(start_md, nudge_inc_deg, nudge_azi_deg, nudge_bur):
+    """Vertical hole to ``start_md``, then a build to the nudge inclination."""
+    if start_md < -1e-6:
+        raise ValueError("Nudge start depth must be 0 m or deeper.")
+    if not 0.0 < float(nudge_inc_deg) < 90.0:
+        raise ValueError("Nudge inclination must be between 0 and 90 degrees.")
+    if float(nudge_bur) <= 0:
+        raise ValueError("Nudge BUR must be greater than 0 deg/30 m.")
+    radius = 30.0 / math.radians(float(nudge_bur))
+    inc = math.radians(float(nudge_inc_deg))
+    build_md = radius * inc
+    end_md = float(start_md) + build_md
+    tvd_end = float(start_md) + radius * math.sin(inc)
+    hd_end = radius * (1.0 - math.cos(inc))
+    azi = math.radians(float(nudge_azi_deg) % 360.0)
+    return {
+        "start_md": float(start_md),
+        "end_md": end_md,
+        "inc_deg": float(nudge_inc_deg),
+        "azi_deg": float(nudge_azi_deg) % 360.0,
+        "bur": float(nudge_bur),
+        "radius": radius,
+        "tvd_end": tvd_end,
+        "hd_end": hd_end,
+        "north_end": hd_end * math.cos(azi),
+        "east_end": hd_end * math.sin(azi),
+    }
+
+
+def _hold_to_kop(nudge, kop):
+    """Hold the nudge attitude from the end of the nudge down to KOP."""
+    if float(kop) < nudge["end_md"] - 0.01:
+        raise ValueError(
+            f"KOP ({float(kop):.2f} m) is above the end of the nudge "
+            f"({nudge['end_md']:.2f} m MD). The main-design KOP must be below the nudge."
+        )
+    kop = max(float(kop), nudge["end_md"])
+    dmd = kop - nudge["end_md"]
+    inc = math.radians(nudge["inc_deg"])
+    azi = math.radians(nudge["azi_deg"])
+    tvd = nudge["tvd_end"] + dmd * math.cos(inc)
+    hd = nudge["hd_end"] + dmd * math.sin(inc)
+    return {
+        "kop": kop,
+        "tvd": tvd,
+        "north": hd * math.cos(azi),
+        "east": hd * math.sin(azi),
+        "inc": nudge["inc_deg"],
+        "azi": nudge["azi_deg"],
+    }
+
+
+def _closure_residual(inc0, azi0, inc_f, azi_f, length, tangent_length, delta):
+    d_n, d_e, d_v = _arc_displacement(
+        math.radians(inc0), math.radians(azi0),
+        math.radians(inc_f), math.radians(azi_f),
+        float(length),
+    )
+    i_f = math.radians(inc_f)
+    a_f = math.radians(azi_f)
+    pred = np.array([
+        float(d_n) + tangent_length * math.sin(i_f) * math.cos(a_f),
+        float(d_e) + tangent_length * math.sin(i_f) * math.sin(a_f),
+        float(d_v) + tangent_length * math.cos(i_f),
+    ], dtype=float)
+    miss = pred - np.asarray(delta, dtype=float)
+    return float(np.linalg.norm(miss)), pred
+
+
+def _best_curve_tangent(inc0, azi0, delta, inc_f, azi_f, bur):
+    """Closure of one minimum-curvature curve at a fixed BUR, plus its tangent."""
+    phi = float(_dogleg_rad_arrays(
+        math.radians(inc0), math.radians(azi0),
+        math.radians(inc_f), math.radians(azi_f),
+    ))
+    dls = math.radians(float(bur)) / 30.0
+    curve_len = 0.0 if phi < 1e-10 else phi / dls
+    d_n, d_e, d_v = _arc_displacement(
+        math.radians(inc0), math.radians(azi0),
+        math.radians(inc_f), math.radians(azi_f),
+        curve_len,
+    )
+    remain = np.asarray(delta, dtype=float) - np.array([float(d_n), float(d_e), float(d_v)])
+    tangent = np.array([
+        math.sin(math.radians(inc_f)) * math.cos(math.radians(azi_f)),
+        math.sin(math.radians(inc_f)) * math.sin(math.radians(azi_f)),
+        math.cos(math.radians(inc_f)),
+    ])
+    tangent_len = float(np.dot(remain, tangent))
+    if tangent_len < -1e-3:
+        return None
+    miss = float(np.linalg.norm(remain - tangent_len * tangent))
+    return miss, float(inc_f), float(azi_f) % 360.0, curve_len, tangent_len
+
+
+def _refine_fixed_bur(inc0, azi0, delta, inc_f, azi_f, bur, inc_fixed=False):
+    """Tighten inclination and azimuth around a seed. Inclination stays fixed when requested."""
+    best = _best_curve_tangent(inc0, azi0, delta, inc_f, azi_f, bur)
+    if best is None:
+        best = (1e9, inc_f, azi_f, 0.0, 0.0)
+    for scale in (1.0, 0.2, 0.05):
+        inc_vals = [inc_f] if inc_fixed else np.linspace(best[1] - scale, best[1] + scale, 9)
+        azi_vals = np.linspace(best[2] - 2.0 * scale, best[2] + 2.0 * scale, 17)
+        for inc_try in inc_vals:
+            if not 0.2 < float(inc_try) < 89.8:
+                continue
+            for azi_try in azi_vals:
+                item = _best_curve_tangent(inc0, azi0, delta, float(inc_try), float(azi_try) % 360.0, bur)
+                if item is not None and item[0] < best[0]:
+                    best = item
+    return best
+
+
+def _solve_curve_and_tangent(inc0, azi0, delta, final_inc=None, bur=None):
+    """Find the build/turn and tangent that land on ``delta`` (north, east, TVD).
+
+    Supply ``final_inc`` to solve BUR, or ``bur`` to solve the final inclination.
+    Returns final inc, final azimuth, curve length, tangent length, BUR and closure.
+    """
+    delta = np.asarray(delta, dtype=float)
+    if final_inc is not None and bur is None:
+        inc_f = float(final_inc)
+        i0 = math.radians(inc0)
+        a0 = math.radians(azi0)
+        i_f = math.radians(inc_f)
+        best = None
+        for azi in np.linspace(0.0, 360.0, 721, endpoint=False):
+            a_f = math.radians(float(azi))
+            phi = float(_dogleg_rad_arrays(i0, a0, i_f, a_f))
+            rf = 1.0 if phi < 1e-10 else (2.0 / phi) * math.tan(phi / 2.0)
+            matrix = np.array([
+                [0.5 * (math.sin(i0) * math.cos(a0) + math.sin(i_f) * math.cos(a_f)) * rf,
+                 math.sin(i_f) * math.cos(a_f)],
+                [0.5 * (math.sin(i0) * math.sin(a0) + math.sin(i_f) * math.sin(a_f)) * rf,
+                 math.sin(i_f) * math.sin(a_f)],
+                [0.5 * (math.cos(i0) + math.cos(i_f)) * rf, math.cos(i_f)],
+            ], dtype=float)
+            sol, _, _, _ = np.linalg.lstsq(matrix, delta, rcond=None)
+            curve_len = float(sol[0])
+            tangent_len = float(sol[1])
+            if curve_len < -1e-3 or tangent_len < -1e-3:
+                continue
+            curve_len = max(0.0, curve_len)
+            tangent_len = max(0.0, tangent_len)
+            miss, _ = _closure_residual(inc0, azi0, inc_f, float(azi), curve_len, tangent_len, delta)
+            phi_deg = math.degrees(phi)
+            solved_bur = 0.0 if curve_len < 1e-4 else phi_deg / curve_len * 30.0
+            item = (miss, inc_f, float(azi) % 360.0, curve_len, tangent_len, solved_bur)
+            if best is None or item[0] < best[0]:
+                best = item
+        if best is None:
+            raise ValueError(
+                "The target cannot be reached from the nudge at this inclination. "
+                "Lower the nudge inclination or move the KOP."
+            )
+        seed_azi = best[2]
+        for azi in np.linspace(seed_azi - 0.6, seed_azi + 0.6, 121):
+            a_f = math.radians(float(azi) % 360.0)
+            phi = float(_dogleg_rad_arrays(i0, a0, i_f, a_f))
+            rf = 1.0 if phi < 1e-10 else (2.0 / phi) * math.tan(phi / 2.0)
+            matrix = np.array([
+                [0.5 * (math.sin(i0) * math.cos(a0) + math.sin(i_f) * math.cos(a_f)) * rf,
+                 math.sin(i_f) * math.cos(a_f)],
+                [0.5 * (math.sin(i0) * math.sin(a0) + math.sin(i_f) * math.sin(a_f)) * rf,
+                 math.sin(i_f) * math.sin(a_f)],
+                [0.5 * (math.cos(i0) + math.cos(i_f)) * rf, math.cos(i_f)],
+            ], dtype=float)
+            sol, _, _, _ = np.linalg.lstsq(matrix, delta, rcond=None)
+            curve_len = max(0.0, float(sol[0]))
+            tangent_len = max(0.0, float(sol[1]))
+            if float(sol[0]) < -1e-3 or float(sol[1]) < -1e-3:
+                continue
+            miss, _ = _closure_residual(inc0, azi0, inc_f, float(azi) % 360.0, curve_len, tangent_len, delta)
+            phi_deg = math.degrees(phi)
+            solved_bur = 0.0 if curve_len < 1e-4 else phi_deg / curve_len * 30.0
+            item = (miss, inc_f, float(azi) % 360.0, curve_len, tangent_len, solved_bur)
+            if item[0] < best[0]:
+                best = item
+        miss, inc_f, azi_f, curve_len, tangent_len, solved_bur = best
+    elif bur is not None and final_inc is None:
+        incs = np.linspace(0.5, 89.0, 178)
+        azis = np.linspace(0.0, 360.0, 360, endpoint=False)
+        best = None
+        for inc_f in incs:
+            for azi in azis[::2]:
+                item = _best_curve_tangent(inc0, azi0, delta, float(inc_f), float(azi), bur)
+                if item is not None and (best is None or item[0] < best[0]):
+                    best = item
+        if best is None:
+            raise ValueError(
+                f"BUR {float(bur):.2f} deg/30 m cannot build a path from the nudge to the target. "
+                "Increase the BUR."
+            )
+        best = _refine_fixed_bur(inc0, azi0, delta, best[1], best[2], bur, inc_fixed=False)
+        miss, inc_f, azi_f, curve_len, tangent_len = best
+        solved_bur = float(bur)
+    else:
+        raise ValueError("The main design must fix either the final inclination or the BUR.")
+
+    if miss > _NUDGE_CLOSURE_M:
+        if bur is not None:
+            raise ValueError(
+                f"BUR {float(bur):.2f} deg/30 m is too low to reach the target from the nudge. "
+                "Increase the BUR, or move the nudge so the main design has room to build and turn. "
+                f"The closest approach is {miss:.2f} m."
+            )
+        raise ValueError(
+            "The target cannot be reached with these values. "
+            "The KOP has to be below the end of the nudge, and the build has to be able to turn "
+            f"from the nudge ({inc0:.2f}° inclination, {azi0:.2f}° azimuth) onto the target. "
+            f"The closest approach is {miss:.2f} m."
+        )
+    return {
+        "inc": float(inc_f),
+        "azimuth": float(azi_f) % 360.0,
+        "curve_length": float(curve_len),
+        "tangent_length": float(tangent_len),
+        "bur": float(solved_bur),
+        "closure_m": float(miss),
+    }
+
+
+def _solve_kop_inc_bur(nudge, target_north, target_east, target_tvd, target_inc, bur):
+    """Solve KOP for a fixed final inclination and BUR. KOP stays below the nudge."""
+    inc = math.radians(nudge["inc_deg"])
+    if abs(math.cos(inc)) < 1e-4:
+        raise ValueError("The nudge inclination is too close to horizontal to hold down to a KOP.")
+    max_hold = max(0.0, (target_tvd - nudge["tvd_end"]) / math.cos(inc))
+    kop_hi = nudge["end_md"] + max_hold
+    if kop_hi < nudge["end_md"] + 1.0:
+        raise ValueError(
+            f"The nudge already reaches TVD {nudge['tvd_end']:.2f} m, at or below the target TVD "
+            f"{target_tvd:.2f} m. Reduce the nudge start depth, inclination or BUR."
+        )
+    best = None
+    for kop in np.linspace(nudge["end_md"], kop_hi, 120):
+        held = _hold_to_kop(nudge, float(kop))
+        if held["tvd"] > target_tvd + 0.5:
+            continue
+        delta = np.array([
+            target_north - held["north"],
+            target_east - held["east"],
+            target_tvd - held["tvd"],
+        ])
+        for azi in np.linspace(0.0, 360.0, 360, endpoint=False):
+            item = _best_curve_tangent(
+                nudge["inc_deg"], nudge["azi_deg"], delta, float(target_inc), float(azi), bur
+            )
+            if item is None:
+                continue
+            packed = (item[0], float(kop), item[2], item[3], item[4])
+            if best is None or packed[0] < best[0]:
+                best = packed
+    if best is None:
+        raise ValueError(
+            f"BUR {float(bur):.2f} deg/30 m is too low, or the nudge ends too deep, "
+            "to reach the target with a KOP below the nudge."
+        )
+    miss, kop, azi, curve_len, tangent_len = best
+    for kop_try in np.linspace(kop - 25.0, kop + 25.0, 26):
+        if kop_try < nudge["end_md"] - 1e-6:
+            continue
+        held = _hold_to_kop(nudge, float(kop_try))
+        delta = np.array([
+            target_north - held["north"],
+            target_east - held["east"],
+            target_tvd - held["tvd"],
+        ])
+        refined = _refine_fixed_bur(
+            nudge["inc_deg"], nudge["azi_deg"], delta, float(target_inc), azi, bur, inc_fixed=True
+        )
+        if refined[0] < miss:
+            miss, _, azi, curve_len, tangent_len = refined
+            kop = float(kop_try)
+    if miss > _NUDGE_CLOSURE_M:
+        raise ValueError(
+            f"BUR {float(bur):.2f} deg/30 m is too low, or the nudge ends too deep, "
+            "to reach the target with a KOP below the nudge. "
+            f"The closest approach is {miss:.2f} m."
+        )
+    return {
+        "kop": float(kop),
+        "inc": float(target_inc),
+        "azimuth": float(azi) % 360.0,
+        "curve_length": float(curve_len),
+        "tangent_length": float(tangent_len),
+        "bur": float(bur),
+        "closure_m": float(miss),
+    }
+
+
+def plan_nudged_design(
+    surface_n, surface_e, rkb,
+    target_n, target_e, target_tvdss,
+    nudge_start_md, nudge_azimuth, nudge_inc, nudge_bur,
+    method, kop=None, target_inc=None, bur=None,
+    td_mode="Automatic", custom_td=None, station_interval=30.0,
+):
+    """Build a vertical hole, a nudge, then the main design on to the target.
+
+    ``method`` is ``KOP + Inclination``, ``KOP + BUR`` or ``Inclination + BUR``.
+    The main curve uses minimum curvature from the nudge attitude to the
+    attitude that reaches the target. Returns the Phase 2 detailed frame,
+    summary, info and the solved design values.
+    """
+    target_tvd = float(rkb) - float(target_tvdss)
+    if target_tvd <= 0:
+        raise ValueError("Target TVD must be below the RKB.")
+    nudge = _nudge_section(nudge_start_md, nudge_inc, nudge_azimuth, nudge_bur)
+    if nudge["tvd_end"] > target_tvd + 0.5:
+        raise ValueError(
+            f"The nudge reaches TVD {nudge['tvd_end']:.2f} m before the target TVD "
+            f"{target_tvd:.2f} m. Reduce the nudge start depth, inclination or BUR."
+        )
+
+    rel_n = float(target_n) - float(surface_n)
+    rel_e = float(target_e) - float(surface_e)
+
+    if method == "KOP + Inclination":
+        if kop is None or target_inc is None:
+            raise ValueError("KOP and target inclination are required for this design method.")
+        held = _hold_to_kop(nudge, kop)
+        if held["tvd"] > target_tvd + 0.5:
+            raise ValueError(
+                f"KOP {held['kop']:.2f} m is too deep: holding the nudge reaches TVD "
+                f"{held['tvd']:.2f} m before the target TVD {target_tvd:.2f} m."
+            )
+        solved = _solve_curve_and_tangent(
+            nudge["inc_deg"], nudge["azi_deg"],
+            np.array([rel_n - held["north"], rel_e - held["east"], target_tvd - held["tvd"]]),
+            final_inc=float(target_inc),
+        )
+        solved["kop"] = held["kop"]
+    elif method == "KOP + BUR":
+        if kop is None or bur is None:
+            raise ValueError("KOP and BUR are required for this design method.")
+        if float(bur) <= 0:
+            raise ValueError("BUR must be greater than 0 deg/30 m.")
+        held = _hold_to_kop(nudge, kop)
+        if held["tvd"] > target_tvd + 0.5:
+            raise ValueError(
+                f"KOP {held['kop']:.2f} m is too deep: holding the nudge reaches TVD "
+                f"{held['tvd']:.2f} m before the target TVD {target_tvd:.2f} m."
+            )
+        solved = _solve_curve_and_tangent(
+            nudge["inc_deg"], nudge["azi_deg"],
+            np.array([rel_n - held["north"], rel_e - held["east"], target_tvd - held["tvd"]]),
+            bur=float(bur),
+        )
+        solved["kop"] = held["kop"]
+    elif method == "Inclination + BUR":
+        if target_inc is None or bur is None:
+            raise ValueError("Target inclination and BUR are required for this design method.")
+        if float(bur) <= 0:
+            raise ValueError("BUR must be greater than 0 deg/30 m.")
+        solved = _solve_kop_inc_bur(
+            nudge, rel_n, rel_e, target_tvd, float(target_inc), float(bur)
+        )
+    else:
+        raise ValueError(f"Unknown design method: {method}")
+
+    kop = float(solved["kop"])
+    curve_len = float(solved["curve_length"])
+    tangent_len = float(solved["tangent_length"])
+    eob = kop + curve_len
+    target_md = eob + tangent_len
+    if td_mode == "Automatic":
+        td = math.ceil(target_md / station_interval - 1e-12) * station_interval
+    else:
+        if custom_td is None:
+            raise ValueError("Custom TD is required.")
+        td = float(custom_td)
+        if td < target_md - 1e-6:
+            raise ValueError(f"Custom TD must be at least the target MD ({target_md:.2f} m).")
+
+    keys = [0.0, nudge["start_md"], nudge["end_md"], kop, eob, target_md, td]
+    regular = list(np.arange(0.0, td + station_interval * 0.01, station_interval))
+    mds = sorted({
+        round(float(md), 6)
+        for md in regular + keys
+        if -1e-8 <= float(md) <= td + 1e-6
+    })
+    rows = []
+    for md in mds:
+        if md <= nudge["start_md"] + 1e-8:
+            inc, azi, section = 0.0, 0.0, "Vertical"
+        elif md <= nudge["end_md"] + 1e-8:
+            theta = (md - nudge["start_md"]) / nudge["radius"]
+            inc, azi, section = math.degrees(theta), nudge["azi_deg"], "Nudge"
+        elif md <= kop + 1e-8:
+            inc, azi, section = nudge["inc_deg"], nudge["azi_deg"], "Hold"
+        elif md <= eob + 1e-8 and curve_len > 1e-6:
+            inc, azi = _attitude_along_arc(
+                nudge["inc_deg"], nudge["azi_deg"],
+                solved["inc"], solved["azimuth"],
+                (md - kop) / curve_len,
+            )
+            section = "Build"
+        else:
+            inc, azi, section = solved["inc"], solved["azimuth"], "Tangent"
+        rows.append({"MD": md, "Inclination": inc, "Azimuth": azi, "Section": section})
+    survey = pd.DataFrame(rows)
+    calc = minimum_curvature(survey[["MD", "Inclination", "Azimuth"]], surface_e, surface_n, rkb)
+    detailed = phase2_frame_from_calculated(calc, surface_e, surface_n)
+    detailed["Parameter"] = survey["Section"].to_numpy()
+    detailed.loc[detailed.index[0], "Parameter"] = "RKB"
+    target_idx = (detailed["MD"] - target_md).abs().idxmin()
+    detailed.loc[target_idx, "Parameter"] = "Target"
+    detailed.loc[target_idx, "Northing"] = float(target_n)
+    detailed.loc[target_idx, "Easting"] = float(target_e)
+    detailed.loc[target_idx, "TVDSS"] = float(target_tvdss)
+    detailed.loc[target_idx, "TVD"] = target_tvd
+    detailed.loc[target_idx, "N+"] = rel_n
+    detailed.loc[target_idx, "E+"] = rel_e
+    detailed.loc[target_idx, "Displacement"] = math.hypot(rel_n, rel_e)
+    detailed.loc[target_idx, "Inclination"] = solved["inc"]
+    detailed.loc[target_idx, "Azimuth"] = solved["azimuth"]
+    detailed.loc[detailed.index[-1], "Parameter"] = "TD"
+
+    markers = [
+        ("RKB", 0.0),
+        ("Nudge start", nudge["start_md"]),
+        ("Nudge end", nudge["end_md"]),
+        ("KOP", kop),
+        ("EOB", eob),
+        ("Target", target_md),
+        ("TD", td),
+    ]
+    summary = phase2_summary_from_frame(detailed, markers)
+    info = {
+        "source": "Nudged design",
+        "nudge_start_md": nudge["start_md"],
+        "nudge_end_md": nudge["end_md"],
+        "nudge_inc": nudge["inc_deg"],
+        "nudge_azimuth": nudge["azi_deg"],
+        "nudge_bur": nudge["bur"],
+        "kop": kop,
+        "eob": eob,
+        "target_md": target_md,
+        "td": td,
+        "target_inc": solved["inc"],
+        "bur": solved["bur"],
+        "final_azimuth": solved["azimuth"],
+        "closure_m": solved["closure_m"],
+        "target_tvd": target_tvd,
+        "rkb_elevation": float(rkb),
+        "target_depth_masl": float(target_tvdss),
+    }
+    return {
+        "survey": survey[["MD", "Inclination", "Azimuth"]].copy(),
+        "detailed": detailed,
+        "summary": summary,
+        "info": info,
+        "solved": solved,
+        "surface": (float(surface_e), float(surface_n), float(rkb)),
+    }
