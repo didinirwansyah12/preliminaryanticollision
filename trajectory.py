@@ -137,7 +137,7 @@ def add_depth_dependent_uncertainty(
 
     # New method: error rate per 1000 m MD.
     if error_params:
-        offset_params = error_params.get("offset", (0.0, 0.0))
+        offset_params = error_params.get("offset", (25.0, 15.0))
         new_params = error_params.get("new", offset_params)
 
         def _validate_rate(params):

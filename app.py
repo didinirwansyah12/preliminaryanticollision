@@ -655,8 +655,8 @@ def generate_pdf_report(project, result, p3_detailed, uncertainty_result, phase3
     ))
     unc = [
         ["Well Type", "Azimuth Error Rate", "Inclination Error Rate"],
-        ["Offset Wells", f"{_fmt(project.get('offset_rate_azi', 0))} m / 1000 m MD", f"{_fmt(project.get('offset_rate_inc', 0))} m / 1000 m MD"],
-        ["New Well", f"{_fmt(project.get('new_rate_azi', 0))} m / 1000 m MD", f"{_fmt(project.get('new_rate_inc', 0))} m / 1000 m MD"],
+        ["Offset Wells", f"{_fmt(project.get('offset_rate_azi', 25.0))} m / 1000 m MD", f"{_fmt(project.get('offset_rate_inc', 15.0))} m / 1000 m MD"],
+        ["New Well", f"{_fmt(project.get('new_rate_azi', 25.0))} m / 1000 m MD", f"{_fmt(project.get('new_rate_inc', 15.0))} m / 1000 m MD"],
     ]
     story.append(_pdf_table(unc, widths=[55*mm, 55*mm, 55*mm], font_size=8.5))
     story.append(Spacer(1, 4*mm))
@@ -1004,10 +1004,10 @@ WORK_DEFAULTS = {
     "p3_td_mode": "Automatic Standdown Depth (Nearest 30m Multiple after Target Depth)",
     "p3_custom_td": 3030.0,
     "p3_design_well": "",
-    "offset_rate_azi": 5.0,
-    "offset_rate_inc": 3.0,
-    "new_rate_azi": 5.0,
-    "new_rate_inc": 3.0,
+    "offset_rate_azi": 25.0,
+    "offset_rate_inc": 15.0,
+    "new_rate_azi": 25.0,
+    "new_rate_inc": 15.0,
     "project_field": "KKI Make-up Well Patuha 2026",
     "project_client": "",
     "project_location": "Patuha, West Java",
@@ -1551,10 +1551,10 @@ with st.expander("Phase 2 — New Well Trajectory", expanded=False):
                     st.success(f"Uploaded trajectory for {design_well} is now the new well.")
                     if st.session_state.pop("saved_phase3", False) and "result" in st.session_state:
                         run_phase3_screening(
-                            st.session_state.get("offset_rate_azi", 5.0),
-                            st.session_state.get("offset_rate_inc", 3.0),
-                            st.session_state.get("new_rate_azi", 5.0),
-                            st.session_state.get("new_rate_inc", 3.0),
+                            st.session_state.get("offset_rate_azi", 25.0),
+                            st.session_state.get("offset_rate_inc", 15.0),
+                            st.session_state.get("new_rate_azi", 25.0),
+                            st.session_state.get("new_rate_inc", 15.0),
                         )
             except Exception as exc:
                 st.error(f"Design workbook problem: {exc}")
@@ -2175,10 +2175,10 @@ with st.expander("Phase 2 — New Well Trajectory", expanded=False):
                 st.session_state["recalculate_work"] = False
                 if st.session_state.pop("saved_phase3", False) and "result" in st.session_state:
                     run_phase3_screening(
-                        st.session_state.get("offset_rate_azi", 5.0),
-                        st.session_state.get("offset_rate_inc", 3.0),
-                        st.session_state.get("new_rate_azi", 5.0),
-                        st.session_state.get("new_rate_inc", 3.0),
+                        st.session_state.get("offset_rate_azi", 25.0),
+                        st.session_state.get("offset_rate_inc", 15.0),
+                        st.session_state.get("new_rate_azi", 25.0),
+                        st.session_state.get("new_rate_inc", 15.0),
                     )
 
             except Exception as exc:
@@ -2678,21 +2678,21 @@ if "result" in st.session_state and "p3_detailed" in st.session_state:
         st.markdown("**OFFSET WELL UNCERTAINTY**")
         st.markdown("**Azimuth Error Rate**")
         offset_rate_azi = remembered_number(
-            "Rate (m / 1000 m MD)", "offset_rate_azi", 5.0, min_value=0.0, step=0.5,
+            "Rate (m / 1000 m MD)", "offset_rate_azi", 25.0, min_value=0.0, step=0.5,
         )
         st.markdown("**Inclination Error Rate**")
         offset_rate_inc = remembered_number(
-            "Rate (m / 1000 m MD)", "offset_rate_inc", 3.0, min_value=0.0, step=0.5,
+            "Rate (m / 1000 m MD)", "offset_rate_inc", 15.0, min_value=0.0, step=0.5,
         )
     with col2:
         st.markdown("**NEW WELL UNCERTAINTY**")
         st.markdown("**Azimuth Error Rate**")
         new_rate_azi = remembered_number(
-            "Rate (m / 1000 m MD)", "new_rate_azi", 5.0, min_value=0.0, step=0.5,
+            "Rate (m / 1000 m MD)", "new_rate_azi", 25.0, min_value=0.0, step=0.5,
         )
         st.markdown("**Inclination Error Rate**")
         new_rate_inc = remembered_number(
-            "Rate (m / 1000 m MD)", "new_rate_inc", 3.0, min_value=0.0, step=0.5,
+            "Rate (m / 1000 m MD)", "new_rate_inc", 15.0, min_value=0.0, step=0.5,
         )
 
     st.caption(
@@ -3247,10 +3247,10 @@ if "result" in st.session_state and "p3_detailed" in st.session_state:
                         "report_number": project_report_no,
                         "revision": project_revision,
                         "new_well": project_new_well,
-                        "offset_rate_azi": st.session_state.get("offset_rate_azi", 0.0),
-                        "offset_rate_inc": st.session_state.get("offset_rate_inc", 0.0),
-                        "new_rate_azi": st.session_state.get("new_rate_azi", 0.0),
-                        "new_rate_inc": st.session_state.get("new_rate_inc", 0.0),
+                        "offset_rate_azi": st.session_state.get("offset_rate_azi", 25.0),
+                        "offset_rate_inc": st.session_state.get("offset_rate_inc", 15.0),
+                        "new_rate_azi": st.session_state.get("new_rate_azi", 25.0),
+                        "new_rate_inc": st.session_state.get("new_rate_inc", 15.0),
                         "ground_level": p3_saved_inputs.get("Ground Level (mASL)", "—"),
                         "rig_elevation": p3_saved_inputs.get("Rig Elevation (m)", "—"),
                         "rkb_elevation": p3_saved_inputs.get("RKB Elevation (mASL)", "—"),
