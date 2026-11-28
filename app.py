@@ -1,6 +1,7 @@
 import math
 import io
 import os
+import json
 import base64
 import numpy as np
 from math import sqrt, radians, degrees, acos, cos, sin, tan, atan2
@@ -31,9 +32,8 @@ from trajectory import (
     error_envelope_tube_from_path,
     minimum_curvature,
     load_design_well,
-    nudge_survey,
-    phase2_frame_from_calculated,
     phase2_summary_from_frame,
+    plan_nudged_design,
 )
 
 
@@ -910,139 +910,228 @@ def store_new_well_trajectory(summary, detailed, info, inputs, geom, survey, sur
     clear_downstream_results()
 
 
-def validate_nudge_md(params, md_min, md_max):
-    """Reject a nudge that does not fit inside the design survey."""
-    start = float(params["start_md"])
-    length = float(params["nudge_length"])
-    return_length = float(params["return_length"])
-    bur = float(params["bur"])
-    end = start + length + return_length
-    span = f"{float(md_min):.2f}–{float(md_max):.2f} m"
-    if length <= 0 or return_length <= 0:
-        raise ValueError("Nudge length and return length must be greater than 0 m.")
-    if bur <= 0:
-        raise ValueError("Nudge BUR must be greater than 0 deg/30 m.")
-    if start < float(md_min) - 1e-6 or start >= float(md_max) - 1e-6:
-        raise ValueError(
-            f"Nudge start MD {start:.2f} m is outside the design MD range {span}. "
-            "Start at or after the first station and above TD."
-        )
-    if end > float(md_max) + 1e-6:
-        raise ValueError(
-            f"Nudge plus return ends at MD {end:.2f} m, past the design TD {float(md_max):.2f} m. "
-            f"The design MD range is {span}. Shorten the nudge or extend TD."
-        )
+def remembered_number(label, key, default, **kwargs):
+    """Number input whose value can be restored from a saved session."""
+    if key not in st.session_state:
+        st.session_state[key] = default
+    return st.number_input(label, key=key, **kwargs)
 
 
-def render_enable_nudging(md_min=None, md_max=None):
-    """Design-time nudge controls. Returns ``(enabled, params)``."""
-    enabled = st.checkbox("Enable nudging", key="p3_enable_nudge")
+def remembered_radio(label, options, key, default, **kwargs):
+    if key not in st.session_state:
+        st.session_state[key] = default
+    return st.radio(label, options, key=key, **kwargs)
+
+
+def remembered_checkbox(label, key, default=False, **kwargs):
+    if key not in st.session_state:
+        st.session_state[key] = bool(default)
+    return st.checkbox(label, key=key, **kwargs)
+
+
+def remembered_text(label, key, default="", **kwargs):
+    if key not in st.session_state:
+        st.session_state[key] = default
+    return st.text_input(label, key=key, **kwargs)
+
+
+def render_enable_nudging():
+    """Nudge controls shown before the main design parameters. Returns ``(enabled, params)``."""
+    enabled = remembered_checkbox("Enable nudging", "p3_enable_nudge", False)
     if not enabled:
         return False, None
     st.caption(
-        "Walk the design off its plan, then steer back to the original "
-        "inclination and azimuth. The nudge is applied when the trajectory is calculated."
+        "Drill vertical from surface to the nudge start depth, then build at the nudge BUR "
+        "toward the nudge azimuth until the nudge inclination is reached. "
+        "Hold that attitude if the main-design KOP is deeper. "
+        "The main design then builds and turns, by minimum curvature, on to the target. "
+        "Its KOP must be below the end of the nudge."
     )
-    if md_min is not None and md_max is not None:
-        st.caption(f"Design survey MD range: {float(md_min):.2f} m to {float(md_max):.2f} m.")
-    nudge_c1, nudge_c2, nudge_c3 = st.columns(3)
+    nudge_c1, nudge_c2, nudge_c3, nudge_c4 = st.columns(4)
     with nudge_c1:
-        direction = st.selectbox(
-            "Direction",
-            ["Right", "Left", "Build", "Drop"],
-            key="p3_nudge_direction",
-            help="Right increases azimuth, Left decreases it. Build increases inclination, Drop decreases it.",
-        )
-        bur = st.number_input(
-            "Nudge BUR (deg/30m)",
-            min_value=0.1,
-            value=2.0,
-            step=0.1,
-            format="%.2f",
-            key="p3_nudge_bur",
+        start_md = remembered_number(
+            "Nudge start depth (m MD)", "p3_nudge_start", 200.0,
+            min_value=0.0, step=10.0, format="%.2f",
         )
     with nudge_c2:
-        start_md = st.number_input(
-            "Start MD (m)",
-            min_value=0.0,
-            value=300.0,
-            step=10.0,
-            format="%.2f",
-            key="p3_nudge_start",
-        )
-        nudge_length = st.number_input(
-            "Nudge length (m)",
-            min_value=1.0,
-            value=30.0,
-            step=5.0,
-            format="%.2f",
-            key="p3_nudge_length",
+        azimuth = remembered_number(
+            "Nudge azimuth (deg)", "p3_nudge_azimuth", 35.0,
+            min_value=0.0, max_value=360.0, step=1.0, format="%.2f",
         )
     with nudge_c3:
-        return_length = st.number_input(
-            "Return length (m)",
-            min_value=1.0,
-            value=60.0,
-            step=5.0,
-            format="%.2f",
-            key="p3_nudge_return",
-            help="Length available to restore the original inclination and azimuth. BUR is the maximum dogleg.",
+        inclination = remembered_number(
+            "Nudge inclination (deg)", "p3_nudge_inc", 8.0,
+            min_value=0.1, max_value=89.0, step=0.5, format="%.2f",
+            help="Inclination at the end of the nudge.",
+        )
+    with nudge_c4:
+        bur = remembered_number(
+            "Nudge BUR (deg/30m)", "p3_nudge_bur", 2.0,
+            min_value=0.1, step=0.1, format="%.2f",
         )
     return True, {
-        "direction": str(direction).lower(),
-        "bur": float(bur),
         "start_md": float(start_md),
-        "nudge_length": float(nudge_length),
-        "return_length": float(return_length),
+        "azimuth": float(azimuth),
+        "inc": float(inclination),
+        "bur": float(bur),
     }
 
 
-def _mark_nearest(detailed, md, label):
-    idx = (detailed["MD"] - float(md)).abs().idxmin()
-    detailed.loc[idx, "Parameter"] = label
-    return detailed
+WORK_DEFAULTS = {
+    "p3_traj_source": "J-Type design",
+    "p3_surface_n": 9203850.00,
+    "p3_surface_e": 376917.00,
+    "p3_ground": 1923.00,
+    "p3_rig": 0.00,
+    "p3_target_n": 9204720.02,
+    "p3_target_e": 377526.19,
+    "p3_target_z": -801.00,
+    "p3_method": "KOP + Inclination",
+    "p3_kop_1": 700.0,
+    "p3_inc_1": 30.0,
+    "p3_kop_2": 700.0,
+    "p3_bur_2": 2.0,
+    "p3_inc_3": 30.0,
+    "p3_bur_3": 2.0,
+    "p3_enable_nudge": False,
+    "p3_nudge_start": 200.0,
+    "p3_nudge_azimuth": 35.0,
+    "p3_nudge_inc": 8.0,
+    "p3_nudge_bur": 2.0,
+    "p3_td_mode": "Automatic Standdown Depth (Nearest 30m Multiple after Target Depth)",
+    "p3_custom_td": 3030.0,
+    "p3_design_well": "",
+    "offset_rate_azi": 5.0,
+    "offset_rate_inc": 3.0,
+    "new_rate_azi": 5.0,
+    "new_rate_inc": 3.0,
+    "project_field": "KKI Make-up Well Patuha 2026",
+    "project_client": "",
+    "project_location": "Patuha, West Java",
+    "project_prepared": "Rigsis Drilling Team",
+    "project_new_well": "PTH-V-7D",
+    "project_report_no": "3",
+    "project_revision": "0",
+    "include_survey_attachment": True,
+}
 
 
-def rebuild_nudged_trajectory(base_survey, surface_xyz, nudge_params, base_inputs):
-    """Recalculate the design with minimum curvature after a nudge."""
-    nudged = nudge_survey(
-        base_survey,
-        start_md=nudge_params["start_md"],
-        nudge_length=nudge_params["nudge_length"],
-        return_length=nudge_params["return_length"],
-        bur=nudge_params["bur"],
-        direction=nudge_params["direction"],
-    )
-    surface_e, surface_n, surface_z = surface_xyz
-    calc = minimum_curvature(nudged, surface_e, surface_n, surface_z)
-    detailed = phase2_frame_from_calculated(calc, surface_e, surface_n)
-    nudge_end = nudge_params["start_md"] + nudge_params["nudge_length"]
-    return_end = nudge_end + nudge_params["return_length"]
-    detailed.loc[detailed.index[0], "Parameter"] = "RKB"
-    _mark_nearest(detailed, nudge_params["start_md"], "Nudge start")
-    _mark_nearest(detailed, nudge_end, "Nudge end")
-    _mark_nearest(detailed, return_end, "Return end")
-    detailed.loc[detailed.index[-1], "Parameter"] = "TD"
-    summary = phase2_summary_from_frame(detailed, [
-        ("RKB", float(detailed.iloc[0]["MD"])),
-        ("Nudge start", nudge_params["start_md"]),
-        ("Nudge end", nudge_end),
-        ("Return end", return_end),
-        ("TD", float(detailed.iloc[-1]["MD"])),
-    ])
-    inputs = dict(base_inputs)
-    inputs["Nudging"] = (
-        f"{nudge_params['direction']} at {nudge_params['bur']:.2f} deg/30m "
-        f"from MD {nudge_params['start_md']:.2f} m "
-        f"for {nudge_params['nudge_length']:.2f} m, "
-        f"return {nudge_params['return_length']:.2f} m"
-    )
-    info = {
-        "source": "Nudged design",
-        "td": float(detailed.iloc[-1]["MD"]),
-        "nudge": dict(nudge_params),
+def _plain_json(value):
+    if isinstance(value, dict):
+        return {str(k): _plain_json(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain_json(v) for v in value]
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
+    return value
+
+
+def frame_to_jsonable(df):
+    if df is None:
+        return None
+    clean = df.copy()
+    records = clean.astype(object).where(pd.notnull(clean), None).to_dict(orient="list")
+    return {"columns": list(clean.columns), "data": _plain_json(records)}
+
+
+def frame_from_jsonable(payload):
+    if not payload:
+        return None
+    return pd.DataFrame(payload.get("data", {}), columns=payload.get("columns"))
+
+
+def build_saved_work():
+    """Serialize the current inputs and uploaded tables."""
+    inputs = {
+        key: _plain_json(st.session_state.get(key, default))
+        for key, default in WORK_DEFAULTS.items()
     }
-    return summary, detailed, info, inputs
+    return {
+        "version": 1,
+        "inputs": inputs,
+        "offset_header": frame_to_jsonable(st.session_state.get("saved_offset_header")),
+        "offset_survey": frame_to_jsonable(st.session_state.get("saved_offset_survey")),
+        "new_well_header": frame_to_jsonable(st.session_state.get("saved_new_well_header")),
+        "new_well_survey": frame_to_jsonable(st.session_state.get("saved_new_well_survey")),
+        "phase3_was_run": "phase3_summary" in st.session_state,
+    }
+
+
+def apply_saved_work(document):
+    """Restore inputs and uploaded tables. The caller recalculates on the next run."""
+    if not isinstance(document, dict) or document.get("version") != 1:
+        raise ValueError("This file is not a saved anti-collision session.")
+    incoming = document.get("inputs") or {}
+    for key, default in WORK_DEFAULTS.items():
+        st.session_state[key] = incoming.get(key, default)
+    st.session_state["saved_offset_header"] = frame_from_jsonable(document.get("offset_header"))
+    st.session_state["saved_offset_survey"] = frame_from_jsonable(document.get("offset_survey"))
+    st.session_state["saved_new_well_header"] = frame_from_jsonable(document.get("new_well_header"))
+    st.session_state["saved_new_well_survey"] = frame_from_jsonable(document.get("new_well_survey"))
+    header = st.session_state["saved_offset_header"]
+    survey = st.session_state["saved_offset_survey"]
+    if header is not None and survey is not None and not header.empty and not survey.empty:
+        st.session_state["result"] = calculate_all_wells(header, survey)
+    else:
+        st.session_state.pop("result", None)
+    st.session_state["recalculate_work"] = True
+    st.session_state["saved_phase3"] = bool(document.get("phase3_was_run"))
+    clear_downstream_results()
+
+
+def run_phase3_screening(offset_rate_azi, offset_rate_inc, new_rate_azi, new_rate_inc):
+    """Run the preliminary anti-collision screen from the trajectories in session."""
+    new_df = st.session_state["p3_detailed"].copy()
+    new_df["Well"] = "New Well"
+    new_df["X"] = new_df["Easting"].astype(float)
+    new_df["Y"] = new_df["Northing"].astype(float)
+    new_df["Z"] = new_df["TVDSS"].astype(float)
+    new_df["Inclination"] = new_df["Inclination"].astype(float)
+    new_df["Azimuth"] = new_df["Azimuth"].astype(float)
+    new_df["TVD"] = new_df["TVD"].astype(float)
+    new_df["DLS"] = new_df.get("BUR", 0.0)
+    offset_df = st.session_state["result"].copy()
+    combined_df = pd.concat(
+        [
+            offset_df,
+            new_df[[
+                "Well", "MD", "Inclination", "Azimuth", "TVD",
+                "X", "Y", "Z", "DLS",
+            ]],
+        ],
+        ignore_index=True,
+        sort=False,
+    )
+    uncertainty_result = add_depth_dependent_uncertainty(
+        combined_df,
+        error_params={
+            "offset": (float(offset_rate_azi), float(offset_rate_inc)),
+            "new": (float(new_rate_azi), float(new_rate_inc)),
+        },
+    )
+    phase3_summary, phase3_details = preliminary_anti_collision(
+        uncertainty_result[
+            uncertainty_result["Well"].astype(str).str.strip().str.lower() == "new well"
+        ].copy(),
+        uncertainty_result[
+            uncertainty_result["Well"].astype(str).str.strip().str.lower() != "new well"
+        ].copy(),
+        interval_z=5.0,
+        start_offset=25.0,
+    )
+    if phase3_summary.empty:
+        raise ValueError(
+            "Tidak ada pasangan New Well vs Offset Well yang dapat dihitung "
+            "pada rentang TVDSS yang sama."
+        )
+    st.session_state["uncertainty_result"] = uncertainty_result
+    st.session_state["phase3_summary"] = phase3_summary
+    st.session_state["phase3_details"] = phase3_details
+
 
 st.set_page_config(
     page_title="Preliminary Anti-Collision Tool",
@@ -1081,6 +1170,32 @@ st.info(
     "It is not a replacement for detailed directional drilling / "
     "anti-collision analysis."
 )
+
+work_col1, work_col2 = st.columns(2)
+with work_col1:
+    st.download_button(
+        "Download work",
+        data=json.dumps(build_saved_work(), indent=2).encode("utf-8"),
+        file_name="anticollision_work.json",
+        mime="application/json",
+        key="download_work",
+        use_container_width=True,
+    )
+with work_col2:
+    work_file = st.file_uploader(
+        "Upload saved work",
+        type=["json"],
+        key="upload_saved_work",
+    )
+if work_file is not None:
+    work_id = getattr(work_file, "file_id", None) or f"{work_file.name}:{len(work_file.getvalue())}"
+    if st.session_state.get("loaded_work_file_id") != work_id:
+        try:
+            apply_saved_work(json.loads(work_file.getvalue().decode("utf-8")))
+            st.session_state["loaded_work_file_id"] = work_id
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Saved work could not be restored: {exc}")
 
 def create_offset_well_template():
     """Create a blank Excel template matching the required offset-well input format."""
@@ -1132,6 +1247,8 @@ if uploaded:
     try:
         header_df = pd.read_excel(uploaded, sheet_name="Well_Header")
         survey_df = pd.read_excel(uploaded, sheet_name="Survey")
+        st.session_state["saved_offset_header"] = header_df
+        st.session_state["saved_offset_survey"] = survey_df
 
         st.subheader("1. Uploaded Data")
         c1, c2 = st.columns(2)
@@ -1267,15 +1384,16 @@ with st.expander("Phase 2 — New Well Trajectory", expanded=False):
         "Generate a preliminary J-Type trajectory, or upload a design survey "
         "in the same Excel template used for the offset wells. "
         "Header X is Easting, header Y is Northing, and Z is surface elevation. "
-        "Enable nudging while designing the well to walk it off the plan and "
-        "back onto the original inclination and azimuth."
+        "Enable nudging before the main design parameters to drill vertical, "
+        "build to a nudge inclination and azimuth, then connect that point to the target."
     )
 
-    traj_source = st.radio(
+    traj_source = remembered_radio(
         "New well trajectory source",
         ["J-Type design", "Upload Excel design"],
+        "p3_traj_source",
+        "J-Type design",
         horizontal=True,
-        key="p3_traj_source",
     )
 
     if traj_source == "Upload Excel design":
@@ -1307,16 +1425,32 @@ with st.expander("Phase 2 — New Well Trajectory", expanded=False):
                 use_container_width=True,
             )
 
-        if design_file is not None:
-            try:
+        design_header = None
+        design_survey = None
+        try:
+            if design_file is not None:
                 design_header = pd.read_excel(design_file, sheet_name="Well_Header")
                 design_survey = pd.read_excel(design_file, sheet_name="Survey")
+            elif st.session_state.get("saved_new_well_survey") is not None:
+                design_header = st.session_state["saved_new_well_header"]
+                design_survey = st.session_state["saved_new_well_survey"]
+            elif st.session_state.get("recalculate_work"):
+                st.session_state["recalculate_work"] = False
+        except Exception as exc:
+            design_header = None
+            design_survey = None
+            st.error(f"Design workbook problem: {exc}")
+
+        if design_header is not None and design_survey is not None:
+            try:
                 design_names = (
                     design_survey["Well"].dropna().astype(str).str.strip().unique().tolist()
                     if "Well" in design_survey.columns else []
                 )
                 if not design_names:
                     raise ValueError("Survey sheet has no well names.")
+                if st.session_state.get("p3_design_well") not in design_names:
+                    st.session_state["p3_design_well"] = design_names[0]
                 design_well = st.selectbox(
                     "Well to use as the new well",
                     design_names,
@@ -1326,16 +1460,13 @@ with st.expander("Phase 2 — New Well Trajectory", expanded=False):
                     design_survey["Well"].astype(str).str.strip() == design_well
                 ]
                 st.dataframe(preview, use_container_width=True, hide_index=True)
-                preview_md = pd.to_numeric(preview.get("MD"), errors="coerce").dropna()
-                upload_md_min = float(preview_md.min()) if not preview_md.empty else None
-                upload_md_max = float(preview_md.max()) if not preview_md.empty else None
-                upload_nudge_on, upload_nudge = render_enable_nudging(upload_md_min, upload_md_max)
+                use_saved_upload = bool(st.session_state.get("recalculate_work"))
                 if st.button(
                     "Use uploaded trajectory",
                     type="primary",
                     use_container_width=True,
                     key="p3_use_upload",
-                ):
+                ) or use_saved_upload:
                     detailed, survey, surface = load_design_well(
                         design_header, design_survey, design_well
                     )
@@ -1371,41 +1502,27 @@ with st.expander("Phase 2 — New Well Trajectory", expanded=False):
                         "Target Depth (mASL)": float(last["TVDSS"]),
                         "Calculation Method": "Uploaded survey (minimum curvature)",
                     }
-                    nudge_applied = None
-                    nudge_failed = False
-                    if upload_nudge_on:
-                        try:
-                            validate_nudge_md(
-                                upload_nudge,
-                                float(survey["MD"].min()),
-                                float(survey["MD"].max()),
-                            )
-                            summary, detailed, info, inputs = rebuild_nudged_trajectory(
-                                survey, surface, upload_nudge, inputs
-                            )
-                            nudge_applied = upload_nudge
-                        except Exception as exc:
-                            nudge_failed = True
-                            st.error(f"Nudging tidak dapat diterapkan: {exc}")
-                    if not nudge_failed:
-                        store_new_well_trajectory(
-                            summary, detailed, info, inputs, geom, survey, surface,
-                            "Excel upload",
-                            nudge=nudge_applied,
+                    st.session_state["saved_new_well_header"] = design_header
+                    st.session_state["saved_new_well_survey"] = design_survey
+                    store_new_well_trajectory(
+                        summary, detailed, info, inputs, geom, survey, surface,
+                        "Excel upload",
+                    )
+                    st.session_state["recalculate_work"] = False
+                    first_md = float(survey["MD"].min())
+                    if first_md > 0.5:
+                        st.warning(
+                            f"The survey starts at MD {first_md:.2f} m rather than at surface (MD 0). "
+                            "TVD is measured from the first station, the same rule used for offset wells."
                         )
-                        first_md = float(survey["MD"].min())
-                        if first_md > 0.5:
-                            st.warning(
-                                f"The survey starts at MD {first_md:.2f} m rather than at surface (MD 0). "
-                                "TVD is measured from the first station, the same rule used for offset wells."
-                            )
-                        if nudge_applied:
-                            st.success(
-                                f"Uploaded trajectory for {design_well} is now the new well, "
-                                f"with a {nudge_applied['direction']} nudge from MD {nudge_applied['start_md']:.2f} m."
-                            )
-                        else:
-                            st.success(f"Uploaded trajectory for {design_well} is now the new well.")
+                    st.success(f"Uploaded trajectory for {design_well} is now the new well.")
+                    if st.session_state.pop("saved_phase3", False) and "result" in st.session_state:
+                        run_phase3_screening(
+                            st.session_state.get("offset_rate_azi", 5.0),
+                            st.session_state.get("offset_rate_inc", 3.0),
+                            st.session_state.get("new_rate_azi", 5.0),
+                            st.session_state.get("new_rate_inc", 3.0),
+                        )
             except Exception as exc:
                 st.error(f"Design workbook problem: {exc}")
 
@@ -1724,35 +1841,23 @@ with st.expander("Phase 2 — New Well Trajectory", expanded=False):
         p3_c1, p3_c2, p3_c3, p3_c4 = st.columns(4)
 
         with p3_c1:
-            p3_surface_n = st.number_input(
-                "Northing (m)",
-                value=9203850.00,
-                format="%.2f",
-                key="p3_surface_n",
+            p3_surface_n = remembered_number(
+                "Northing (m)", "p3_surface_n", 9203850.00, format="%.2f",
             )
 
         with p3_c2:
-            p3_surface_e = st.number_input(
-                "Easting (m)",
-                value=376917.00,
-                format="%.2f",
-                key="p3_surface_e",
+            p3_surface_e = remembered_number(
+                "Easting (m)", "p3_surface_e", 376917.00, format="%.2f",
             )
 
         with p3_c3:
-            p3_ground = st.number_input(
-                "Ground Level (mASL)",
-                value=1923.00,
-                format="%.2f",
-                key="p3_ground",
+            p3_ground = remembered_number(
+                "Ground Level (mASL)", "p3_ground", 1923.00, format="%.2f",
             )
 
         with p3_c4:
-            p3_rig = st.number_input(
-                "Rig Elevation (m)",
-                value=0.00,
-                format="%.2f",
-                key="p3_rig",
+            p3_rig = remembered_number(
+                "Rig Elevation (m)", "p3_rig", 0.00, format="%.2f",
             )
 
         p3_rkb = p3_ground + p3_rig
@@ -1763,27 +1868,18 @@ with st.expander("Phase 2 — New Well Trajectory", expanded=False):
         p3_t1, p3_t2, p3_t3 = st.columns(3)
 
         with p3_t1:
-            p3_target_n = st.number_input(
-                "Target Northing (m)",
-                value=9204720.02,
-                format="%.2f",
-                key="p3_target_n",
+            p3_target_n = remembered_number(
+                "Target Northing (m)", "p3_target_n", 9204720.02, format="%.2f",
             )
 
         with p3_t2:
-            p3_target_e = st.number_input(
-                "Target Easting (m)",
-                value=377526.19,
-                format="%.2f",
-                key="p3_target_e",
+            p3_target_e = remembered_number(
+                "Target Easting (m)", "p3_target_e", 377526.19, format="%.2f",
             )
 
         with p3_t3:
-            p3_target_z = st.number_input(
-                "Target Depth (mASL)",
-                value=-801.00,
-                format="%.2f",
-                key="p3_target_z",
+            p3_target_z = remembered_number(
+                "Target Depth (mASL)", "p3_target_z", -801.00, format="%.2f",
             )
 
         p3_delta_n = p3_target_n - p3_surface_n
@@ -1796,14 +1892,14 @@ with st.expander("Phase 2 — New Well Trajectory", expanded=False):
 
         st.subheader("3. Design Parameters")
 
-        p3_method = st.radio(
+        p3_nudge_on, p3_nudge_params = render_enable_nudging()
+
+        st.markdown("**Main design**")
+        p3_method = remembered_radio(
             "Calculation Method",
-            [
-                "KOP + Inclination",
-                "KOP + BUR",
-                "Inclination + BUR",
-            ],
-            key="p3_method",
+            ["KOP + Inclination", "KOP + BUR", "Inclination + BUR"],
+            "p3_method",
+            "KOP + Inclination",
         )
 
         p3_d1, p3_d2, p3_d3 = st.columns(3)
@@ -1811,218 +1907,249 @@ with st.expander("Phase 2 — New Well Trajectory", expanded=False):
         if p3_method == "KOP + Inclination":
 
             with p3_d1:
-                p3_kop = st.number_input(
-                    "KOP (m)",
-                    min_value=0.0,
-                    value=700.0,
-                    step=10.0,
-                    format="%.2f",
-                    key="p3_kop_1",
+                p3_kop = remembered_number(
+                    "KOP (m)", "p3_kop_1", 700.0,
+                    min_value=0.0, step=10.0, format="%.2f",
                 )
 
             with p3_d2:
-                p3_inc = st.number_input(
-                    "Target Inclination (deg)",
-                    min_value=0.1,
-                    max_value=89.0,
-                    value=30.0,
-                    step=1.0,
-                    format="%.2f",
-                    key="p3_inc_1",
+                p3_inc = remembered_number(
+                    "Target Inclination (deg)", "p3_inc_1", 30.0,
+                    min_value=0.1, max_value=89.0, step=1.0, format="%.2f",
                 )
 
-            try:
-                p3_bur = p3_calculate_bur_from_kop_inc(
-                    p3_target_tvd, p3_hd, p3_kop, p3_inc
-                )
-                with p3_d3:
-                    st.metric("Calculated BUR", f"{p3_bur:.3f} deg/30m")
-            except Exception as exc:
+            if p3_nudge_on:
                 p3_bur = None
-                st.error(str(exc))
+                with p3_d3:
+                    st.caption("BUR is solved from the nudge to the target when you calculate.")
+            else:
+                try:
+                    p3_bur = p3_calculate_bur_from_kop_inc(
+                        p3_target_tvd, p3_hd, p3_kop, p3_inc
+                    )
+                    with p3_d3:
+                        st.metric("Calculated BUR", f"{p3_bur:.3f} deg/30m")
+                except Exception as exc:
+                    p3_bur = None
+                    st.error(str(exc))
 
         elif p3_method == "KOP + BUR":
 
             with p3_d1:
-                p3_kop = st.number_input(
-                    "KOP (m)",
-                    min_value=0.0,
-                    value=700.0,
-                    step=10.0,
-                    format="%.2f",
-                    key="p3_kop_2",
+                p3_kop = remembered_number(
+                    "KOP (m)", "p3_kop_2", 700.0,
+                    min_value=0.0, step=10.0, format="%.2f",
                 )
 
             with p3_d2:
-                p3_bur = st.number_input(
-                    "BUR (deg/30m)",
-                    min_value=0.01,
-                    value=2.0,
-                    step=0.1,
-                    format="%.2f",
-                    key="p3_bur_2",
+                p3_bur = remembered_number(
+                    "BUR (deg/30m)", "p3_bur_2", 2.0,
+                    min_value=0.01, step=0.1, format="%.2f",
                 )
 
-            try:
-                p3_inc = p3_calculate_inc_from_kop_bur(
-                    p3_target_tvd, p3_hd, p3_kop, p3_bur
-                )
-                with p3_d3:
-                    st.metric(
-                        "Calculated Target Inclination",
-                        f"{p3_inc:.3f} deg"
-                    )
-            except Exception as exc:
+            if p3_nudge_on:
                 p3_inc = None
-                st.error(str(exc))
+                with p3_d3:
+                    st.caption("Target inclination is solved from the nudge when you calculate.")
+            else:
+                try:
+                    p3_inc = p3_calculate_inc_from_kop_bur(
+                        p3_target_tvd, p3_hd, p3_kop, p3_bur
+                    )
+                    with p3_d3:
+                        st.metric(
+                            "Calculated Target Inclination",
+                            f"{p3_inc:.3f} deg"
+                        )
+                except Exception as exc:
+                    p3_inc = None
+                    st.error(str(exc))
 
         else:
 
             with p3_d1:
-                p3_inc = st.number_input(
-                    "Target Inclination (deg)",
-                    min_value=0.1,
-                    max_value=89.0,
-                    value=30.0,
-                    step=1.0,
-                    format="%.2f",
-                    key="p3_inc_3",
+                p3_inc = remembered_number(
+                    "Target Inclination (deg)", "p3_inc_3", 30.0,
+                    min_value=0.1, max_value=89.0, step=1.0, format="%.2f",
                 )
 
             with p3_d2:
-                p3_bur = st.number_input(
-                    "BUR (deg/30m)",
-                    min_value=0.01,
-                    value=2.0,
-                    step=0.1,
-                    format="%.2f",
-                    key="p3_bur_3",
+                p3_bur = remembered_number(
+                    "BUR (deg/30m)", "p3_bur_3", 2.0,
+                    min_value=0.01, step=0.1, format="%.2f",
                 )
 
-            try:
-                p3_kop = p3_calculate_kop_from_inc_bur(
-                    p3_target_tvd, p3_inc, p3_bur
-                )
-                with p3_d3:
-                    st.metric("Calculated KOP", f"{p3_kop:.1f} m")
-            except Exception as exc:
+            if p3_nudge_on:
                 p3_kop = None
-                st.error(str(exc))
-
-        p3_nudge_on, p3_nudge_params = render_enable_nudging()
+                with p3_d3:
+                    st.caption("KOP is solved below the nudge when you calculate.")
+            else:
+                try:
+                    p3_kop = p3_calculate_kop_from_inc_bur(
+                        p3_target_tvd, p3_inc, p3_bur
+                    )
+                    with p3_d3:
+                        st.metric("Calculated KOP", f"{p3_kop:.1f} m")
+                except Exception as exc:
+                    p3_kop = None
+                    st.error(str(exc))
 
         st.subheader("4. Total Depth (TD) Settings")
 
-        p3_td_mode = st.radio(
+        p3_td_mode = remembered_radio(
             "TD Mode",
             [
                 "Automatic Standdown Depth (Nearest 30m Multiple after Target Depth)",
                 "Custom Depth",
             ],
-            key="p3_td_mode",
+            "p3_td_mode",
+            "Automatic Standdown Depth (Nearest 30m Multiple after Target Depth)",
         )
 
         p3_custom_td = None
         if p3_td_mode == "Custom Depth":
-            p3_custom_td = st.number_input(
-                "Custom TD (m MD)",
-                min_value=0.0,
-                value=3030.0,
-                step=30.0,
-                format="%.2f",
-                key="p3_custom_td",
+            p3_custom_td = remembered_number(
+                "Custom TD (m MD)", "p3_custom_td", 3030.0,
+                min_value=0.0, step=30.0, format="%.2f",
             )
 
-        if st.button(
+        calculate_requested = st.button(
             "Calculate New Well Trajectory",
             type="primary",
             use_container_width=True,
             key="p3_calculate",
-        ):
+        ) or bool(st.session_state.get("recalculate_work"))
+        if calculate_requested:
             try:
-                if p3_kop is None or p3_bur is None or p3_inc is None:
-                    raise ValueError("Parameter trajectory belum valid.")
-
                 p3_td_mode_calc = (
                     "Automatic"
                     if p3_td_mode.startswith("Automatic")
                     else "Custom"
                 )
-
-                p3_summary, p3_detailed, p3_info = p3_build_trajectory(
-                    p3_surface_n,
-                    p3_surface_e,
-                    p3_rkb,
-                    p3_target_n,
-                    p3_target_e,
-                    p3_target_z,
-                    float(p3_kop),
-                    float(p3_bur),
-                    float(p3_inc),
-                    p3_td_mode_calc,
-                    p3_custom_td,
-                    30.0,
-                )
-
-                p3_inputs = {
-                    "Trajectory source": "J-Type design",
-                    "Surface Northing (m)": p3_surface_n,
-                    "Surface Easting (m)": p3_surface_e,
-                    "Ground Level (mASL)": p3_ground,
-                    "Rig Elevation (m)": p3_rig,
-                    "RKB Elevation (mASL)": p3_rkb,
-                    "Target Northing (m)": p3_target_n,
-                    "Target Easting (m)": p3_target_e,
-                    "Target Depth (mASL)": p3_target_z,
-                    "Calculation Method": p3_method,
-                    "KOP (m)": p3_kop,
-                    "BUR (deg/30m)": p3_bur,
-                    "Target Inclination (deg)": p3_inc,
-                    "TD Mode": p3_td_mode,
-                    "Custom TD (m)": (
-                        p3_custom_td if p3_custom_td is not None else ""
-                    ),
-                }
                 geom = make_trajectory_geom(
                     p3_surface_n, p3_surface_e, p3_rkb,
                     p3_target_n, p3_target_e, p3_target_z,
                 )
-                design_survey = p3_detailed[["MD", "Inclination", "Azimuth"]].copy()
-                design_surface = (
-                    float(p3_detailed.iloc[0]["Easting"]),
-                    float(p3_detailed.iloc[0]["Northing"]),
-                    float(p3_detailed.iloc[0]["TVDSS"]),
-                )
-                nudge_applied = None
-                nudge_failed = False
                 if p3_nudge_on:
-                    try:
-                        validate_nudge_md(
-                            p3_nudge_params,
-                            float(design_survey["MD"].min()),
-                            float(design_survey["MD"].max()),
-                        )
-                        p3_summary, p3_detailed, p3_info, p3_inputs = rebuild_nudged_trajectory(
-                            design_survey, design_surface, p3_nudge_params, p3_inputs
-                        )
-                        nudge_applied = p3_nudge_params
-                    except Exception as exc:
-                        nudge_failed = True
-                        st.error(f"Nudging tidak dapat diterapkan: {exc}")
-                if not nudge_failed:
-                    store_new_well_trajectory(
-                        p3_summary,
-                        p3_detailed,
-                        p3_info,
-                        p3_inputs,
-                        geom,
-                        design_survey,
-                        design_surface,
-                        "J-Type design",
-                        nudge=nudge_applied,
+                    if p3_method == "KOP + Inclination" and p3_kop is None:
+                        raise ValueError("KOP is required.")
+                    if p3_method == "KOP + BUR" and p3_kop is None:
+                        raise ValueError("KOP is required.")
+                    if p3_method == "KOP + Inclination" and p3_inc is None:
+                        raise ValueError("Target inclination is required.")
+                    if p3_method == "Inclination + BUR" and (p3_inc is None or p3_bur is None):
+                        raise ValueError("Target inclination and BUR are required.")
+                    if p3_method == "KOP + BUR" and p3_bur is None:
+                        raise ValueError("BUR is required.")
+                    planned = plan_nudged_design(
+                        p3_surface_n, p3_surface_e, p3_rkb,
+                        p3_target_n, p3_target_e, p3_target_z,
+                        p3_nudge_params["start_md"],
+                        p3_nudge_params["azimuth"],
+                        p3_nudge_params["inc"],
+                        p3_nudge_params["bur"],
+                        p3_method,
+                        kop=None if p3_kop is None else float(p3_kop),
+                        target_inc=None if p3_inc is None else float(p3_inc),
+                        bur=None if p3_bur is None else float(p3_bur),
+                        td_mode=p3_td_mode_calc,
+                        custom_td=p3_custom_td,
+                    )
+                    p3_summary = planned["summary"]
+                    p3_detailed = planned["detailed"]
+                    p3_info = planned["info"]
+                    nudge_applied = {
+                        "start_md": p3_nudge_params["start_md"],
+                        "azimuth": p3_nudge_params["azimuth"],
+                        "inc": p3_nudge_params["inc"],
+                        "bur": p3_nudge_params["bur"],
+                    }
+                    p3_inputs = {
+                        "Trajectory source": "J-Type design",
+                        "Surface Northing (m)": p3_surface_n,
+                        "Surface Easting (m)": p3_surface_e,
+                        "Ground Level (mASL)": p3_ground,
+                        "Rig Elevation (m)": p3_rig,
+                        "RKB Elevation (mASL)": p3_rkb,
+                        "Target Northing (m)": p3_target_n,
+                        "Target Easting (m)": p3_target_e,
+                        "Target Depth (mASL)": p3_target_z,
+                        "Calculation Method": p3_method,
+                        "KOP (m)": p3_info["kop"],
+                        "BUR (deg/30m)": p3_info["bur"],
+                        "Target Inclination (deg)": p3_info["target_inc"],
+                        "TD Mode": p3_td_mode,
+                        "Custom TD (m)": p3_custom_td if p3_custom_td is not None else "",
+                        "Nudging": (
+                            f"start MD {nudge_applied['start_md']:.2f} m, "
+                            f"azimuth {nudge_applied['azimuth']:.2f} deg, "
+                            f"inclination {nudge_applied['inc']:.2f} deg, "
+                            f"BUR {nudge_applied['bur']:.2f} deg/30m"
+                        ),
+                    }
+                else:
+                    if p3_kop is None or p3_bur is None or p3_inc is None:
+                        raise ValueError("Parameter trajectory belum valid.")
+                    p3_summary, p3_detailed, p3_info = p3_build_trajectory(
+                        p3_surface_n,
+                        p3_surface_e,
+                        p3_rkb,
+                        p3_target_n,
+                        p3_target_e,
+                        p3_target_z,
+                        float(p3_kop),
+                        float(p3_bur),
+                        float(p3_inc),
+                        p3_td_mode_calc,
+                        p3_custom_td,
+                        30.0,
+                    )
+                    nudge_applied = None
+                    p3_inputs = {
+                        "Trajectory source": "J-Type design",
+                        "Surface Northing (m)": p3_surface_n,
+                        "Surface Easting (m)": p3_surface_e,
+                        "Ground Level (mASL)": p3_ground,
+                        "Rig Elevation (m)": p3_rig,
+                        "RKB Elevation (mASL)": p3_rkb,
+                        "Target Northing (m)": p3_target_n,
+                        "Target Easting (m)": p3_target_e,
+                        "Target Depth (mASL)": p3_target_z,
+                        "Calculation Method": p3_method,
+                        "KOP (m)": p3_kop,
+                        "BUR (deg/30m)": p3_bur,
+                        "Target Inclination (deg)": p3_inc,
+                        "TD Mode": p3_td_mode,
+                        "Custom TD (m)": (
+                            p3_custom_td if p3_custom_td is not None else ""
+                        ),
+                    }
+                store_new_well_trajectory(
+                    p3_summary,
+                    p3_detailed,
+                    p3_info,
+                    p3_inputs,
+                    geom,
+                    p3_detailed[["MD", "Inclination", "Azimuth"]],
+                    (
+                        float(p3_detailed.iloc[0]["Easting"]),
+                        float(p3_detailed.iloc[0]["Northing"]),
+                        float(p3_detailed.iloc[0]["TVDSS"]),
+                    ),
+                    "J-Type design",
+                    nudge=nudge_applied,
+                )
+                st.session_state["recalculate_work"] = False
+                if st.session_state.pop("saved_phase3", False) and "result" in st.session_state:
+                    run_phase3_screening(
+                        st.session_state.get("offset_rate_azi", 5.0),
+                        st.session_state.get("offset_rate_inc", 3.0),
+                        st.session_state.get("new_rate_azi", 5.0),
+                        st.session_state.get("new_rate_inc", 3.0),
                     )
 
             except Exception as exc:
+                st.session_state["recalculate_work"] = False
                 st.error(f"Trajectory tidak dapat dibuat: {exc}")
 
     if "p3_summary" in st.session_state and "p3_geom" in st.session_state:
@@ -2517,22 +2644,22 @@ if "result" in st.session_state and "p3_detailed" in st.session_state:
     with col1:
         st.markdown("**OFFSET WELL UNCERTAINTY**")
         st.markdown("**Azimuth Error Rate**")
-        offset_rate_azi = st.number_input(
-            "Rate (m / 1000 m MD)", min_value=0.0, value=5.0, step=0.5, key="offset_rate_azi"
+        offset_rate_azi = remembered_number(
+            "Rate (m / 1000 m MD)", "offset_rate_azi", 5.0, min_value=0.0, step=0.5,
         )
         st.markdown("**Inclination Error Rate**")
-        offset_rate_inc = st.number_input(
-            "Rate (m / 1000 m MD)", min_value=0.0, value=3.0, step=0.5, key="offset_rate_inc"
+        offset_rate_inc = remembered_number(
+            "Rate (m / 1000 m MD)", "offset_rate_inc", 3.0, min_value=0.0, step=0.5,
         )
     with col2:
         st.markdown("**NEW WELL UNCERTAINTY**")
         st.markdown("**Azimuth Error Rate**")
-        new_rate_azi = st.number_input(
-            "Rate (m / 1000 m MD)", min_value=0.0, value=5.0, step=0.5, key="new_rate_azi"
+        new_rate_azi = remembered_number(
+            "Rate (m / 1000 m MD)", "new_rate_azi", 5.0, min_value=0.0, step=0.5,
         )
         st.markdown("**Inclination Error Rate**")
-        new_rate_inc = st.number_input(
-            "Rate (m / 1000 m MD)", min_value=0.0, value=3.0, step=0.5, key="new_rate_inc"
+        new_rate_inc = remembered_number(
+            "Rate (m / 1000 m MD)", "new_rate_inc", 3.0, min_value=0.0, step=0.5,
         )
 
     st.caption(
@@ -2549,66 +2676,9 @@ if "result" in st.session_state and "p3_detailed" in st.session_state:
         key="phase3_run_anti_collision",
     ):
         try:
-            # Build New Well dataframe from the latest calculated trajectory.
-            new_df = st.session_state["p3_detailed"].copy()
-            new_df["Well"] = "New Well"
-            new_df["X"] = new_df["Easting"].astype(float)
-            new_df["Y"] = new_df["Northing"].astype(float)
-            new_df["Z"] = new_df["TVDSS"].astype(float)
-            new_df["Inclination"] = new_df["Inclination"].astype(float)
-            new_df["Azimuth"] = new_df["Azimuth"].astype(float)
-            new_df["TVD"] = new_df["TVD"].astype(float)
-            new_df["DLS"] = new_df.get("BUR", 0.0)
-
-            # Offset wells from Phase 1.
-            offset_df = st.session_state["result"].copy()
-            combined_df = pd.concat(
-                [
-                    offset_df,
-                    new_df[
-                        [
-                            "Well", "MD", "Inclination", "Azimuth", "TVD",
-                            "X", "Y", "Z", "DLS"
-                        ]
-                    ],
-                ],
-                ignore_index=True,
-                sort=False,
+            run_phase3_screening(
+                offset_rate_azi, offset_rate_inc, new_rate_azi, new_rate_inc
             )
-
-            error_params = {
-                "offset": (offset_rate_azi, offset_rate_inc),
-                "new": (new_rate_azi, new_rate_inc),
-            }
-
-            # Uncertainty is an internal calculation now; the user does not
-            # need to generate a separate envelope phase.
-            uncertainty_result = add_depth_dependent_uncertainty(
-                combined_df,
-                error_params=error_params,
-            )
-
-            phase3_summary, phase3_details = preliminary_anti_collision(
-                uncertainty_result[
-                    uncertainty_result["Well"].astype(str).str.strip().str.lower() == "new well"
-                ].copy(),
-                uncertainty_result[
-                    uncertainty_result["Well"].astype(str).str.strip().str.lower() != "new well"
-                ].copy(),
-                interval_z=5.0,
-                start_offset=25.0,
-            )
-
-            if phase3_summary.empty:
-                raise ValueError(
-                    "Tidak ada pasangan New Well vs Offset Well yang dapat dihitung "
-                    "pada rentang TVDSS yang sama."
-                )
-
-            st.session_state["uncertainty_result"] = uncertainty_result
-            st.session_state["phase3_summary"] = phase3_summary
-            st.session_state["phase3_details"] = phase3_details
-
         except Exception as exc:
             st.error(f"Anti-collision analysis tidak dapat dijalankan: {exc}")
 
@@ -3117,19 +3187,19 @@ if "result" in st.session_state and "p3_detailed" in st.session_state:
             with st.expander("Project / Report Information", expanded=True):
                 pi1, pi2 = st.columns(2)
                 with pi1:
-                    project_field = st.text_input("Project / Field Name", value="KKI Make-up Well Patuha 2026", key="project_field")
-                    project_client = st.text_input("Client / Company", value="", key="project_client")
-                    project_location = st.text_input("Location", value="Patuha, West Java", key="project_location")
+                    project_field = remembered_text("Project / Field Name", "project_field", "KKI Make-up Well Patuha 2026")
+                    project_client = remembered_text("Client / Company", "project_client", "")
+                    project_location = remembered_text("Location", "project_location", "Patuha, West Java")
                 with pi2:
-                    project_prepared = st.text_input("Prepared By", value="Rigsis Drilling Team", key="project_prepared")
-                    project_new_well = st.text_input("New Well Name", value="PTH-V-7D", key="project_new_well")
-                    project_report_no = st.text_input("Report Number", value="3", key="project_report_no")
-                    project_revision = st.text_input("Revision", value="0", key="project_revision")
+                    project_prepared = remembered_text("Prepared By", "project_prepared", "Rigsis Drilling Team")
+                    project_new_well = remembered_text("New Well Name", "project_new_well", "PTH-V-7D")
+                    project_report_no = remembered_text("Report Number", "project_report_no", "3")
+                    project_revision = remembered_text("Revision", "project_revision", "0")
 
-            include_survey_attachment = st.checkbox(
+            include_survey_attachment = remembered_checkbox(
                 "Include detailed survey data as an attachment in the PDF",
-                value=True,
-                key="include_survey_attachment",
+                "include_survey_attachment",
+                True,
             )
 
             if st.button("Generate Preliminary Anti-Collision PDF Report", type="primary", use_container_width=True, key="generate_pdf_report"):
